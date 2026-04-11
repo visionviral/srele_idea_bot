@@ -132,10 +132,13 @@ SEND_MESSAGE:{"channel": "<channel-name>", "message": "<the message to send>"}
 - Always confirm to the user that you'll send the message.
 
 RULES:
-- Only output ONE command per message (SAVE_IDEA, SAVE_LEARNING, PUSH_CODE, or SEND_MESSAGE — never combine them)
+- Only output ONE command per message (SAVE_IDEA, SAVE_LEARNING, PUSH_CODE, SEND_MESSAGE, or READ_CODE — never combine them)
 - Place the command at the END, after your conversational response
 - For Discord, keep chat responses reasonably concise but don't sacrifice quality
-- For code and technical answers, be as thorough as needed"""
+- For code and technical answers, be as thorough as needed
+- NEVER proactively read or fix your own code unless the user EXPLICITLY asks you to (e.g. "fix this", "update your code", "add a feature"). If something doesn't work, just tell the user it didn't work — don't auto-debug yourself.
+- When the user asks you to DO something (like send a message), just DO it. Don't analyze your code first. Only read code if the action fails or the user asks for a code change.
+- Keep responses to ONE message. Don't split across multiple messages unless absolutely necessary."""
 
 # Per-channel conversation history (keeps last messages for context)
 conversation_history = {}
@@ -571,7 +574,7 @@ def chat_with_claude(channel_id, user_name, user_message, embed_context="", imag
 
     message = claude_client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        max_tokens=16384,
         system=build_system_prompt(),
         messages=history,
     )
@@ -662,15 +665,31 @@ async def resolve_mentions(guild, message_text):
     matches = pattern.findall(message_text)
 
     for name in matches:
-        # Search members by display name or username (case-insensitive)
+        member = None
+
+        # First try the local cache
         member = discord.utils.find(
-            lambda m: m.display_name.lower() == name.lower() or m.name.lower() == name.lower(),
+            lambda m, n=name: m.display_name.lower() == n.lower() or m.name.lower() == n.lower(),
             guild.members
         )
+
+        # If not found in cache, search Discord directly
+        if not member:
+            try:
+                results = await guild.query_members(query=name, limit=5)
+                for m in results:
+                    if m.display_name.lower() == name.lower() or m.name.lower() == name.lower():
+                        member = m
+                        break
+                # If exact match not found, use first result
+                if not member and results:
+                    member = results[0]
+            except Exception as e:
+                print(f"Could not query members for '{name}': {e}")
+
         if member:
             message_text = message_text.replace(f"{{{{{name}}}}}", member.mention)
         else:
-            # Leave the name as-is if not found
             message_text = message_text.replace(f"{{{{{name}}}}}", f"@{name}")
 
     return message_text
