@@ -110,12 +110,15 @@ CRITICAL SAFETY RULES FOR CODE CHANGES:
 WORKFLOW FOR LEARNING NEW SKILLS (code changes):
 1. User tells you something doesn't work or asks for a new feature
 2. You output READ_CODE:{"file": "bot.py"} to see your current code
-3. The bot shows you the code
+3. The bot fetches the code from GitHub and feeds it back to you
 4. You identify exactly what needs to change
 5. You make ONLY the targeted changes, keeping everything else identical
-6. You show the complete updated file to the user
-7. User says "push it" → you output PUSH_CODE to deploy
-8. You confirm: "I just learned [skill]. Now I can [capability]."
+6. In your response, show ONLY the parts you changed (a short diff/summary), NOT the entire file — the full file is too large for Discord
+7. Put the COMPLETE updated file content in the PUSH_CODE command (Discord won't display this, it goes straight to GitHub)
+8. User says "push it" → code gets pushed to GitHub → Railway auto-deploys
+9. You confirm: "I just learned [skill]. Now I can [capability]."
+
+IMPORTANT: The PUSH_CODE content is NOT shown in Discord — it goes directly to GitHub. So you CAN include the full file there even though it's large. Only your chat message has the Discord character limit.
 
 SENDING MESSAGES TO OTHER CHANNELS:
 When a user asks you to send a message to another channel or @mention someone:
@@ -141,8 +144,21 @@ MAX_HISTORY = 20
 # How many recent channel messages to fetch for background context
 CHANNEL_CONTEXT_LIMIT = 50
 
-# Cached learnings from Monday.com (loaded on startup, updated live)
+# Cached learnings (loaded on startup, updated live)
 srele_learnings = []
+
+# Recent error log (so Srele can debug itself)
+recent_errors = []
+MAX_ERRORS = 10
+
+def log_error(error_msg):
+    """Store recent errors so Srele can see what went wrong."""
+    recent_errors.append({
+        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "error": str(error_msg)[:500],
+    })
+    if len(recent_errors) > MAX_ERRORS:
+        recent_errors.pop(0)
 
 # ============================================================
 # URL FETCHING — extract info from links (fallback)
@@ -1021,14 +1037,17 @@ async def on_message(message):
                         await message.channel.send(chunk)
 
         except anthropic.APIError as e:
+            log_error(f"Anthropic API: {e}")
             await message.reply(f"Oops, brain glitch. Try again? (`{str(e)[:80]}`)")
             print(f"Anthropic API error: {e}")
 
         except requests.exceptions.RequestException as e:
+            log_error(f"Monday.com API: {e}")
             await message.reply(f"Couldn't reach Monday.com. Try again? (`{str(e)[:80]}`)")
             print(f"Monday.com API error: {e}")
 
         except Exception as e:
+            log_error(f"Unexpected: {e}")
             await message.reply(f"Something went wrong. Try again? (`{str(e)[:80]}`)")
             print(f"Unexpected error: {e}")
 
@@ -1171,6 +1190,25 @@ async def slash_memory(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"Couldn't fetch memory: `{str(e)[:100]}`")
         print(f"memory error: {e}")
+
+
+@bot.tree.command(name="srele-errors", description="Show recent bot errors (for debugging)")
+async def slash_errors(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    if not recent_errors:
+        await interaction.followup.send("No recent errors.")
+        return
+
+    embed = discord.Embed(title="Recent Srele Errors", color=0xff0000)
+    for err in recent_errors[-5:]:
+        embed.add_field(
+            name=err["time"],
+            value=f"`{err['error'][:200]}`",
+            inline=False,
+        )
+    embed.set_footer(text=f"{len(recent_errors)} total errors logged")
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="summarize", description="Summarize the recent conversation in this channel")
