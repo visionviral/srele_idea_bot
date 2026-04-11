@@ -8,6 +8,7 @@ Otherwise, Srele just chats normally.
 """
 
 import os
+import asyncio
 import datetime
 import json
 import re
@@ -242,18 +243,24 @@ def generate_item_name(raw_idea):
     return name
 
 
-def chat_with_claude(channel_id, user_name, user_message):
+def chat_with_claude(channel_id, user_name, user_message, embed_context=""):
     """Send a message to Claude with conversation history and return the response."""
     if channel_id not in conversation_history:
         conversation_history[channel_id] = []
 
     history = conversation_history[channel_id]
 
-    # Fetch context from any URLs in the message
-    url_context = extract_url_context(user_message)
+    # Build message with all available context
     message_content = f"[{user_name}]: {user_message}"
-    if url_context:
-        message_content += f"\n\n--- Fetched link content ---\n{url_context}"
+
+    # Use Discord embed data first (most reliable — Discord already fetched the preview)
+    if embed_context:
+        message_content += f"\n\n--- Link preview from Discord ---\n{embed_context}"
+    else:
+        # Fall back to fetching URLs directly
+        url_context = extract_url_context(user_message)
+        if url_context:
+            message_content += f"\n\n--- Fetched link content ---\n{url_context}"
 
     history.append({
         "role": "user",
@@ -345,6 +352,36 @@ async def on_message(message):
         )
         return
 
+    # If message has URLs but no embeds yet, wait briefly for Discord to generate them
+    has_urls = URL_PATTERN.search(raw_text)
+    if has_urls and not message.embeds:
+        await asyncio.sleep(2)
+        # Re-fetch the message to get embeds Discord may have added
+        try:
+            message = await message.channel.fetch_message(message.id)
+        except Exception:
+            pass
+
+    # Extract info from Discord embeds (link previews that Discord auto-generates)
+    embed_context = ""
+    if message.embeds:
+        embed_parts = []
+        for emb in message.embeds:
+            parts = []
+            if emb.author and emb.author.name:
+                parts.append(f"Author: {emb.author.name}")
+            if emb.title:
+                parts.append(f"Title: {emb.title}")
+            if emb.description:
+                parts.append(f"Description: {emb.description}")
+            if emb.footer and emb.footer.text:
+                parts.append(f"Footer: {emb.footer.text}")
+            if parts:
+                source = emb.url or "link preview"
+                embed_parts.append(f"[Embed from {source}]\n" + "\n".join(parts))
+        if embed_parts:
+            embed_context = "\n\n".join(embed_parts)
+
     async with message.channel.typing():
         try:
             # Get Claude's response (conversational + possible save command)
@@ -352,6 +389,7 @@ async def on_message(message):
                 str(message.channel.id),
                 message.author.display_name,
                 raw_text,
+                embed_context=embed_context,
             )
 
             # Check if Claude wants to save an idea
