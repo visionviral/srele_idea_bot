@@ -68,6 +68,8 @@ YOUR CAPABILITIES:
 6. Read images/screenshots — analyze anything visual
 7. Read channel history — you always know what's been discussed
 8. Summarize conversations — give recaps of channel discussions
+9. Send messages to other channels — you can post in any channel on the server
+10. Mention users — you can @mention anyone by name
 
 SAVING IDEAS TO MONDAY.COM:
 Only save when the user EXPLICITLY asks (e.g. "save this", "add to to-do", "track this", "put this as an idea").
@@ -91,8 +93,19 @@ PUSH_CODE:{"file": "<filename>", "content": "<the full file content>", "commit_m
 - NEVER push code without showing it first and getting confirmation
 - IMPORTANT: When modifying bot.py, include the COMPLETE file content, not just the changed parts
 
+SENDING MESSAGES TO OTHER CHANNELS:
+When a user asks you to send a message to another channel or @mention someone:
+- You CAN do this. Output at the END of your message:
+SEND_MESSAGE:{"channel": "<channel-name>", "message": "<the message to send>"}
+- The channel name should NOT include the # symbol, just the name (e.g. "general", "ideas", "random")
+- To mention a user in the message, use their display name wrapped in double curly braces: {{username}}
+  Example: "Hey {{Matej}}, are you coming to the office?"
+  The bot will resolve the name to the correct Discord @mention.
+- You can mention multiple users in one message.
+- Always confirm to the user that you'll send the message.
+
 RULES:
-- Only output ONE command per message (SAVE_IDEA, SAVE_LEARNING, or PUSH_CODE — never combine them)
+- Only output ONE command per message (SAVE_IDEA, SAVE_LEARNING, PUSH_CODE, or SEND_MESSAGE — never combine them)
 - Place the command at the END, after your conversational response
 - For Discord, keep chat responses reasonably concise but don't sacrifice quality
 - For code and technical answers, be as thorough as needed"""
@@ -520,6 +533,40 @@ def parse_push_command(response_text):
         return response_text, None
 
 
+def parse_send_message_command(response_text):
+    """Check if Claude's response contains a SEND_MESSAGE command."""
+    match = re.search(r'SEND_MESSAGE:(\{.*?\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+
+    try:
+        send_data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, send_data
+    except json.JSONDecodeError:
+        return response_text, None
+
+
+async def resolve_mentions(guild, message_text):
+    """Replace {{username}} with actual Discord @mentions."""
+    pattern = re.compile(r'\{\{(.+?)\}\}')
+    matches = pattern.findall(message_text)
+
+    for name in matches:
+        # Search members by display name or username (case-insensitive)
+        member = discord.utils.find(
+            lambda m: m.display_name.lower() == name.lower() or m.name.lower() == name.lower(),
+            guild.members
+        )
+        if member:
+            message_text = message_text.replace(f"{{{{{name}}}}}", member.mention)
+        else:
+            # Leave the name as-is if not found
+            message_text = message_text.replace(f"{{{{{name}}}}}", f"@{name}")
+
+    return message_text
+
+
 # Pending code pushes waiting for user confirmation (channel_id -> push_data)
 pending_pushes = {}
 
@@ -782,6 +829,31 @@ async def on_message(message):
                     f"**Ready to push `{file_name}`** — \"{commit_msg}\"\n\n"
                     f"Say **\"push it\"** to deploy or **\"cancel\"** to abort."
                 )
+                return
+
+            # Check for send message command
+            display_text, send_data = parse_send_message_command(display_text)
+            if send_data:
+                target_channel_name = send_data.get("channel", "").strip().lstrip("#")
+                msg_to_send = send_data.get("message", "")
+
+                if target_channel_name and msg_to_send:
+                    # Find the channel by name
+                    target_channel = discord.utils.get(message.guild.text_channels, name=target_channel_name)
+                    if target_channel:
+                        # Resolve {{username}} mentions
+                        msg_to_send = await resolve_mentions(message.guild, msg_to_send)
+                        await target_channel.send(msg_to_send)
+
+                        if display_text:
+                            await message.reply(display_text)
+                        else:
+                            await message.reply(f"Sent to #{target_channel_name}")
+                        await message.add_reaction("\u2709\ufe0f")  # envelope
+                    else:
+                        await message.reply(f"Couldn't find channel **#{target_channel_name}**. Check the name?")
+                else:
+                    await message.reply(display_text or "I need a channel name and a message to send.")
                 return
 
             # Check for save idea command
