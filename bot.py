@@ -32,7 +32,6 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 MONDAY_BOARD_ID = 5089081467
 MONDAY_GROUP_ID = "group_mm1m2py5"       # SRELE IDEAS group
-MONDAY_MEMORY_GROUP = "srele_memory"      # Will be created on first use
 MONDAY_API_URL = "https://api.monday.com/v2"
 
 COL_PRIORITY = "status"
@@ -234,128 +233,51 @@ def add_item_update(item_id, body_text):
 
 
 # ============================================================
-# SRELE MEMORY — persistent learnings on Monday.com
+# SRELE MEMORY — persistent learnings in learnings.json
+# This file is SEPARATE from bot.py. Never touch bot.py for memory.
+# Learnings survive all code updates because they live in their own file.
 # ============================================================
 
-def ensure_memory_group():
-    """Create the SRELE MEMORY group on the board if it doesn't exist."""
-    try:
-        # Check if group exists
-        query = """
-        query ($boardId: [ID!]!) {
-            boards(ids: $boardId) {
-                groups {
-                    id
-                    title
-                }
-            }
-        }
-        """
-        result = monday_request(query, {"boardId": [str(MONDAY_BOARD_ID)]})
-        groups = result["data"]["boards"][0]["groups"]
-
-        for g in groups:
-            if g["id"] == MONDAY_MEMORY_GROUP:
-                return True
-
-        # Create the group
-        query = """
-        mutation ($boardId: ID!, $groupName: String!, $groupId: String!) {
-            create_group(
-                board_id: $boardId,
-                group_name: $groupName,
-                group_id: $groupId
-            ) {
-                id
-            }
-        }
-        """
-        monday_request(query, {
-            "boardId": str(MONDAY_BOARD_ID),
-            "groupName": "SRELE MEMORY",
-            "groupId": MONDAY_MEMORY_GROUP,
-        })
-        print("Created SRELE MEMORY group on Monday.com")
-        return True
-
-    except Exception as e:
-        print(f"Could not ensure memory group: {e}")
-        return False
+LEARNINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "learnings.json")
 
 
 def load_learnings():
-    """Load all learnings from the SRELE MEMORY group on Monday.com."""
+    """Load all learnings from learnings.json."""
     global srele_learnings
     try:
-        query = """
-        query ($boardId: [ID!]!) {
-            boards(ids: $boardId) {
-                groups(ids: ["srele_memory"]) {
-                    items_page(limit: 100) {
-                        items {
-                            id
-                            name
-                        }
-                    }
-                }
-            }
-        }
-        """
-        result = monday_request(query, {"boardId": [str(MONDAY_BOARD_ID)]})
-        groups = result["data"]["boards"][0]["groups"]
-
-        if not groups:
-            srele_learnings = []
-            return
-
-        items = groups[0]["items_page"]["items"]
-        srele_learnings = [item["name"] for item in items]
-        print(f"Loaded {len(srele_learnings)} learnings from Monday.com")
-
+        with open(LEARNINGS_FILE, "r") as f:
+            data = json.load(f)
+        srele_learnings = data.get("learnings", [])
+        print(f"Loaded {len(srele_learnings)} learnings from learnings.json")
+    except FileNotFoundError:
+        print("learnings.json not found, starting with empty memory")
+        srele_learnings = []
     except Exception as e:
         print(f"Could not load learnings: {e}")
         srele_learnings = []
 
 
 def save_learning(learning_text, taught_by=""):
-    """Save a new learning to the SRELE MEMORY group on Monday.com."""
+    """Save a new learning to learnings.json."""
     global srele_learnings
     try:
-        ensure_memory_group()
+        # Load current file (in case another process updated it)
+        try:
+            with open(LEARNINGS_FILE, "r") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {"learnings": []}
 
-        # Create item with just the name (the learning itself)
-        query = """
-        mutation ($boardId: ID!, $groupId: String!, $itemName: String!) {
-            create_item(
-                board_id: $boardId,
-                group_id: $groupId,
-                item_name: $itemName
-            ) {
-                id
-                name
-            }
-        }
-        """
-        variables = {
-            "boardId": str(MONDAY_BOARD_ID),
-            "groupId": MONDAY_MEMORY_GROUP,
-            "itemName": learning_text,
-        }
+        # Add the new learning
+        data["learnings"].append(learning_text)
 
-        result = monday_request(query, variables)
-        item_id = result["data"]["create_item"]["id"]
-
-        # Add a comment with who taught this and when
-        if taught_by:
-            update_body = (
-                f"<strong>Taught by:</strong> {taught_by}\n"
-                f"<strong>Date:</strong> {datetime.datetime.now().strftime('%B %d, %Y at %I:%M %p')}"
-            )
-            add_item_update(item_id, update_body)
+        # Write back
+        with open(LEARNINGS_FILE, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
 
         # Update local cache
-        srele_learnings.append(learning_text)
-        print(f"Saved learning: \"{learning_text}\"")
+        srele_learnings = data["learnings"]
+        print(f"Saved learning: \"{learning_text}\" (taught by {taught_by})")
         return True
 
     except Exception as e:
@@ -534,8 +456,7 @@ async def on_ready():
     print(f" Monday.com board: {MONDAY_BOARD_ID}")
     print(f" Listening for @Srele mentions...\n")
 
-    # Load learnings from Monday.com on startup
-    ensure_memory_group()
+    # Load learnings from learnings.json on startup
     load_learnings()
 
     await bot.change_presence(
@@ -829,7 +750,7 @@ async def slash_memory(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
     try:
-        load_learnings()  # Refresh from Monday.com
+        load_learnings()  # Refresh from learnings.json
 
         if not srele_learnings:
             await interaction.followup.send("I haven't learned anything yet! Teach me by saying `@Srele learn this: ...`")
