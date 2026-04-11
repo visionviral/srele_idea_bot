@@ -1018,7 +1018,28 @@ async def on_message(message):
                     if target_channel:
                         # Resolve {{username}} mentions
                         msg_to_send = await resolve_mentions(message.guild, msg_to_send)
-                        await target_channel.send(msg_to_send)
+
+                        # Check for image/GIF URLs — send as embed so the link is hidden
+                        image_pattern = re.search(r'(https?://\S+\.(?:gif|png|jpg|jpeg|webp)\S*)', msg_to_send, re.IGNORECASE)
+                        tenor_pattern = re.search(r'(https?://tenor\.com/\S+)', msg_to_send, re.IGNORECASE)
+                        giphy_pattern = re.search(r'(https?://(?:media\.)?giphy\.com/\S+)', msg_to_send, re.IGNORECASE)
+
+                        gif_url = None
+                        if image_pattern:
+                            gif_url = image_pattern.group(1)
+                        elif tenor_pattern:
+                            gif_url = tenor_pattern.group(1)
+                        elif giphy_pattern:
+                            gif_url = giphy_pattern.group(1)
+
+                        if gif_url:
+                            # Remove the URL from the text
+                            clean_msg = msg_to_send.replace(gif_url, "").strip()
+                            embed = discord.Embed(description=clean_msg if clean_msg else None)
+                            embed.set_image(url=gif_url)
+                            await target_channel.send(content=clean_msg if clean_msg else None, embed=embed)
+                        else:
+                            await target_channel.send(msg_to_send)
 
                         if display_text:
                             await message.reply(display_text)
