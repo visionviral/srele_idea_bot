@@ -309,25 +309,23 @@ def add_item_update(item_id, body_text):
 # GITHUB API — self-modification (push code changes)
 # ============================================================
 
-def github_push_file(file_path, content, commit_message):
-    """Push a file to the GitHub repo. Returns True on success."""
+def github_push_file_raw(file_path, content, commit_message):
+    """Push a file to the GitHub repo (low-level). Returns True on success."""
     if not GITHUB_TOKEN:
-        print("No GITHUB_TOKEN set — cannot push")
-        return False, "No GitHub token configured. Add GITHUB_TOKEN to Railway env vars."
+        return False, "No GitHub token configured."
 
+    import base64
     api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
     }
 
-    # Get the current file's SHA (needed for updates)
     resp = requests.get(api_url, headers=headers, params={"ref": GITHUB_BRANCH})
     sha = None
     if resp.status_code == 200:
         sha = resp.json().get("sha")
 
-    import base64
     encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
 
     payload = {
@@ -341,11 +339,49 @@ def github_push_file(file_path, content, commit_message):
     resp = requests.put(api_url, headers=headers, json=payload)
     if resp.status_code in (200, 201):
         print(f"Pushed {file_path} to GitHub: {commit_message}")
-        return True, f"Pushed `{file_path}` to GitHub. Railway will auto-deploy."
+        return True, f"Pushed `{file_path}` to GitHub."
     else:
         error = resp.json().get("message", resp.text[:100])
         print(f"GitHub push failed: {error}")
         return False, f"GitHub push failed: {error}"
+
+
+def github_push_file(file_path, content, commit_message):
+    """Push a file to GitHub WITH automatic backup.
+    Before pushing bot.py, saves the current version as bot.backup.py."""
+
+    # Auto-backup: save current bot.py to bot.backup.py before overwriting
+    if file_path == "bot.py":
+        current_code = github_read_file("bot.py")
+        if current_code:
+            github_push_file_raw("bot.backup.py", current_code, f"Backup before: {commit_message}")
+            print("Backed up current bot.py to bot.backup.py")
+
+    return github_push_file_raw(file_path, content, commit_message)
+
+
+def github_rollback():
+    """Restore bot.backup.py back to bot.py."""
+    backup_code = github_read_file("bot.backup.py")
+    if not backup_code:
+        return False, "No backup found (bot.backup.py doesn't exist on GitHub)."
+
+    success, msg = github_push_file_raw("bot.py", backup_code, "Rollback: restoring bot.backup.py to bot.py")
+    if success:
+        return True, "Rolled back to last backup. Railway will auto-deploy."
+    return False, msg
+
+
+def github_confirm_backup():
+    """Update bot.backup.py to match the current bot.py (confirms current version is good)."""
+    current_code = github_read_file("bot.py")
+    if not current_code:
+        return False, "Couldn't read current bot.py from GitHub."
+
+    success, msg = github_push_file_raw("bot.backup.py", current_code, "Confirm: updating backup to current working version")
+    if success:
+        return True, "Backup updated to current version. This is now the safe rollback point."
+    return False, msg
 
 
 def github_read_file(file_path):
@@ -552,7 +588,7 @@ def chat_with_claude(channel_id, user_name, user_message, embed_context="", imag
 
 def parse_save_command(response_text):
     """Check if Claude's response contains a SAVE_IDEA command."""
-    match = re.search(r'SAVE_IDEA:(\{.*?\})', response_text, re.DOTALL)
+    match = re.search(r'SAVE_IDEA:(\{.*\})', response_text, re.DOTALL)
     if not match:
         return response_text, None
 
@@ -566,7 +602,7 @@ def parse_save_command(response_text):
 
 def parse_learning_command(response_text):
     """Check if Claude's response contains a SAVE_LEARNING command."""
-    match = re.search(r'SAVE_LEARNING:(\{.*?\})', response_text, re.DOTALL)
+    match = re.search(r'SAVE_LEARNING:(\{.*\})', response_text, re.DOTALL)
     if not match:
         return response_text, None
 
@@ -594,7 +630,7 @@ def parse_push_command(response_text):
 
 def parse_send_message_command(response_text):
     """Check if Claude's response contains a SEND_MESSAGE command."""
-    match = re.search(r'SEND_MESSAGE:(\{.*?\})', response_text, re.DOTALL)
+    match = re.search(r'SEND_MESSAGE:(\{.*\})', response_text, re.DOTALL)
     if not match:
         return response_text, None
 
@@ -608,7 +644,7 @@ def parse_send_message_command(response_text):
 
 def parse_read_code_command(response_text):
     """Check if Claude's response contains a READ_CODE command."""
-    match = re.search(r'READ_CODE:(\{.*?\})', response_text, re.DOTALL)
+    match = re.search(r'READ_CODE:(\{.*\})', response_text, re.DOTALL)
     if not match:
         return response_text, None
 
@@ -1209,6 +1245,46 @@ async def slash_errors(interaction: discord.Interaction):
         )
     embed.set_footer(text=f"{len(recent_errors)} total errors logged")
     await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="rollback", description="Restore Srele to the last confirmed working version")
+async def slash_rollback(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        success, msg = github_rollback()
+        if success:
+            embed = discord.Embed(
+                title="Rolled Back",
+                description="Restored bot.py from backup. Railway will auto-deploy in ~30 seconds.",
+                color=0xff9900,
+            )
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send(f"Rollback failed: {msg}")
+    except Exception as e:
+        await interaction.followup.send(f"Rollback error: `{str(e)[:100]}`")
+        print(f"Rollback error: {e}")
+
+
+@bot.tree.command(name="confirm", description="Confirm current version works — updates the backup")
+async def slash_confirm(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        success, msg = github_confirm_backup()
+        if success:
+            embed = discord.Embed(
+                title="Backup Updated",
+                description="Current bot.py is now the safe rollback point. If anything breaks in the future, `/rollback` will restore this version.",
+                color=0x00c875,
+            )
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send(f"Confirm failed: {msg}")
+    except Exception as e:
+        await interaction.followup.send(f"Confirm error: `{str(e)[:100]}`")
+        print(f"Confirm error: {e}")
 
 
 @bot.tree.command(name="summarize", description="Summarize the recent conversation in this channel")
