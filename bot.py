@@ -93,6 +93,17 @@ PUSH_CODE:{"file": "<filename>", "content": "<the full file content>", "commit_m
 - NEVER push code without showing it first and getting confirmation
 - IMPORTANT: When modifying bot.py, include the COMPLETE file content, not just the changed parts
 
+CRITICAL SAFETY RULES FOR CODE CHANGES:
+- NEVER rewrite bot.py from scratch or from memory. You MUST keep the existing code structure.
+- ONLY add, remove, or change the specific parts needed for the requested feature.
+- NEVER change environment variable names. The correct names are:
+  DISCORD_BOT_TOKEN, MONDAY_API_TOKEN, ANTHROPIC_API_KEY, GITHUB_TOKEN
+- NEVER change the GITHUB_REPO value (visionviral/srele_idea_bot) or MONDAY_BOARD_ID (5089081467)
+- NEVER remove existing features when adding new ones
+- NEVER change the Claude model from claude-opus-4-6
+- NEVER add new pip dependencies without also updating requirements.txt
+- If you are unsure about the current code structure, tell the user you need to see the current bot.py first rather than guessing
+
 SENDING MESSAGES TO OTHER CHANNELS:
 When a user asks you to send a message to another channel or @mention someone:
 - You CAN do this. Output at the END of your message:
