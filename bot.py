@@ -15,6 +15,7 @@ import discord
 from discord.ext import commands
 import anthropic
 import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -69,6 +70,77 @@ Keep your responses concise — you're in a Discord chat, not writing an essay. 
 # Per-channel conversation history (keeps last messages for context)
 conversation_history = {}
 MAX_HISTORY = 20
+
+# ============================================================
+# URL FETCHING — extract info from links
+# ============================================================
+
+URL_PATTERN = re.compile(r'https?://\S+')
+
+def fetch_url_context(url):
+    """Fetch a URL and extract title + description from meta tags."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+        resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Extract Open Graph / meta info
+        title = None
+        description = None
+
+        # Try og:title first, then <title>
+        og_title = soup.find("meta", property="og:title")
+        if og_title and og_title.get("content"):
+            title = og_title["content"]
+        elif soup.title and soup.title.string:
+            title = soup.title.string.strip()
+
+        # Try og:description, then meta description
+        og_desc = soup.find("meta", property="og:description")
+        if og_desc and og_desc.get("content"):
+            description = og_desc["content"]
+        else:
+            meta_desc = soup.find("meta", attrs={"name": "description"})
+            if meta_desc and meta_desc.get("content"):
+                description = meta_desc["content"]
+
+        if not title and not description:
+            return None
+
+        result = ""
+        if title:
+            result += f"Title: {title}\n"
+        if description:
+            result += f"Description: {description}\n"
+        return result.strip()
+
+    except Exception as e:
+        print(f"Could not fetch URL {url}: {e}")
+        return None
+
+
+def extract_url_context(text):
+    """Find URLs in text, fetch their metadata, and return context string."""
+    urls = URL_PATTERN.findall(text)
+    if not urls:
+        return ""
+
+    context_parts = []
+    for url in urls[:3]:  # Limit to 3 URLs max
+        info = fetch_url_context(url)
+        if info:
+            context_parts.append(f"[Content from {url}]\n{info}")
+
+    if not context_parts:
+        return ""
+
+    return "\n\n".join(context_parts)
+
 
 # ============================================================
 # MONDAY.COM API
@@ -177,9 +249,15 @@ def chat_with_claude(channel_id, user_name, user_message):
 
     history = conversation_history[channel_id]
 
+    # Fetch context from any URLs in the message
+    url_context = extract_url_context(user_message)
+    message_content = f"[{user_name}]: {user_message}"
+    if url_context:
+        message_content += f"\n\n--- Fetched link content ---\n{url_context}"
+
     history.append({
         "role": "user",
-        "content": f"[{user_name}]: {user_message}"
+        "content": message_content,
     })
 
     # Trim history if too long
