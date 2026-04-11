@@ -84,6 +84,9 @@ Keep your responses concise — you're in a Discord chat, not writing an essay. 
 conversation_history = {}
 MAX_HISTORY = 20
 
+# How many recent channel messages to fetch for background context
+CHANNEL_CONTEXT_LIMIT = 50
+
 # Cached learnings from Monday.com (loaded on startup, updated live)
 srele_learnings = []
 
@@ -348,7 +351,7 @@ def fetch_image_as_base64(url):
         return None, None
 
 
-def chat_with_claude(channel_id, user_name, user_message, embed_context="", image_urls=None):
+def chat_with_claude(channel_id, user_name, user_message, embed_context="", image_urls=None, channel_context=""):
     """Send a message to Claude with conversation history and return the response."""
     if channel_id not in conversation_history:
         conversation_history[channel_id] = []
@@ -364,6 +367,10 @@ def chat_with_claude(channel_id, user_name, user_message, embed_context="", imag
         url_context = extract_url_context(user_message)
         if url_context:
             text_content += f"\n\n--- Fetched link content ---\n{url_context}"
+
+    # Add recent channel history so Srele knows what's been discussed
+    if channel_context:
+        text_content += f"\n\n--- Recent channel messages (for context, not directed at you) ---\n{channel_context}"
 
     # Build message content — text only or multimodal (text + images)
     if image_urls:
@@ -440,6 +447,54 @@ def parse_learning_command(response_text):
 
 
 # ============================================================
+# CHANNEL HISTORY — read recent messages for context
+# ============================================================
+
+async def fetch_channel_history(channel, limit=CHANNEL_CONTEXT_LIMIT):
+    """Fetch recent messages from a Discord channel and format them as context."""
+    messages = []
+    async for msg in channel.history(limit=limit, oldest_first=False):
+        if msg.author.bot and msg.author.display_name == "Srele":
+            messages.append(f"[Srele]: {msg.content[:300]}")
+        else:
+            content = msg.content[:300]
+            # Note attachments
+            if msg.attachments:
+                att_names = ", ".join(a.filename for a in msg.attachments)
+                content += f" [attachments: {att_names}]"
+            if content.strip():
+                messages.append(f"[{msg.author.display_name}]: {content}")
+
+    messages.reverse()  # Oldest first
+    return messages
+
+
+async def fetch_channel_history_for_summary(channel, limit=200):
+    """Fetch more messages for a full channel summary."""
+    messages = []
+    async for msg in channel.history(limit=limit, oldest_first=False):
+        if msg.content.strip():
+            timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M")
+            content = msg.content[:500]
+            author = msg.author.display_name
+            messages.append(f"[{timestamp}] {author}: {content}")
+
+    messages.reverse()
+    return messages
+
+
+def summarize_with_claude(messages_text):
+    """Use Claude to summarize a channel's conversation."""
+    message = claude_client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2000,
+        system="You are summarizing a Discord channel conversation. Give a clear, organized summary with:\n1. Main topics discussed\n2. Key decisions or conclusions\n3. Action items or ideas mentioned\n4. Notable disagreements or open questions\n\nBe concise but thorough. Use bullet points. Don't include every message — focus on what matters.",
+        messages=[{"role": "user", "content": f"Summarize this conversation:\n\n{messages_text}"}],
+    )
+    return message.content[0].text.strip()
+
+
+# ============================================================
 # DISCORD BOT
 # ============================================================
 
@@ -502,6 +557,45 @@ async def on_message(message):
     if not raw_text and image_urls:
         raw_text = "What's in this image?"
 
+    # Check if user wants a channel summary
+    summarize_keywords = ["summarize this channel", "summarize this thread", "summarize the chat",
+                          "summarize the conversation", "what did i miss", "catch me up",
+                          "what's been discussed", "summary of this channel", "recap this"]
+    if any(kw in raw_text.lower() for kw in summarize_keywords):
+        async with message.channel.typing():
+            try:
+                history_msgs = await fetch_channel_history_for_summary(message.channel, limit=200)
+                if len(history_msgs) < 3:
+                    await message.reply("Not enough messages in this channel to summarize.")
+                    return
+
+                messages_text = "\n".join(history_msgs)
+                summary = summarize_with_claude(messages_text)
+
+                # Split if too long for Discord
+                if len(summary) <= 2000:
+                    await message.reply(summary)
+                else:
+                    chunks = [summary[i:i+2000] for i in range(0, len(summary), 2000)]
+                    await message.reply(chunks[0])
+                    for chunk in chunks[1:]:
+                        await message.channel.send(chunk)
+
+                print(f"Summarized #{message.channel.name} for {message.author.name}")
+            except Exception as e:
+                await message.reply(f"Couldn't summarize: `{str(e)[:80]}`")
+                print(f"Summarize error: {e}")
+        return
+
+    # Fetch recent channel history for background context (so Srele knows what's going on)
+    channel_context = ""
+    try:
+        recent_msgs = await fetch_channel_history(message.channel, limit=CHANNEL_CONTEXT_LIMIT)
+        if recent_msgs:
+            channel_context = "\n".join(recent_msgs)
+    except Exception as e:
+        print(f"Could not fetch channel history: {e}")
+
     # If message has URLs but no embeds yet, wait briefly for Discord to generate them
     has_urls = URL_PATTERN.search(raw_text)
     if has_urls and not message.embeds:
@@ -540,6 +634,7 @@ async def on_message(message):
                 raw_text,
                 embed_context=embed_context,
                 image_urls=image_urls if image_urls else None,
+                channel_context=channel_context,
             )
 
             # Check for learning command first
@@ -763,12 +858,44 @@ async def slash_memory(interaction: discord.Interaction):
             display = learning if len(learning) <= 100 else learning[:97] + "..."
             embed.add_field(name=f"#{i}", value=display, inline=False)
 
-        embed.set_footer(text=f"{len(srele_learnings)} learnings stored on Monday.com")
+        embed.set_footer(text=f"{len(srele_learnings)} learnings stored in learnings.json")
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
         await interaction.followup.send(f"Couldn't fetch memory: `{str(e)[:100]}`")
         print(f"memory error: {e}")
+
+
+@bot.tree.command(name="summarize", description="Summarize the recent conversation in this channel")
+async def slash_summarize(interaction: discord.Interaction, messages: int = 200):
+    """Slash command: /summarize [messages]"""
+    await interaction.response.defer(thinking=True)
+
+    try:
+        # Clamp between 10 and 500
+        msg_count = max(10, min(500, messages))
+
+        history_msgs = await fetch_channel_history_for_summary(interaction.channel, limit=msg_count)
+        if len(history_msgs) < 3:
+            await interaction.followup.send("Not enough messages in this channel to summarize.")
+            return
+
+        messages_text = "\n".join(history_msgs)
+        summary = summarize_with_claude(messages_text)
+
+        embed = discord.Embed(
+            title=f"Channel Summary — #{interaction.channel.name}",
+            description=summary[:4096],
+            color=0x579bfc,
+        )
+        embed.set_footer(text=f"Based on last {len(history_msgs)} messages")
+
+        await interaction.followup.send(embed=embed)
+        print(f"Summarized #{interaction.channel.name} ({len(history_msgs)} msgs) for {interaction.user.name}")
+
+    except Exception as e:
+        await interaction.followup.send(f"Couldn't summarize: `{str(e)[:100]}`")
+        print(f"Summarize error: {e}")
 
 
 # ============================================================
