@@ -1,11 +1,15 @@
 """
 Srele — AI Assistant for the React Biome Discord Server
 
-Srele is a conversational AI assistant powered by Claude.
-- Chats normally by default
-- Saves ideas/tasks to Monday.com when explicitly asked
-- Persistent memory: learnings stored on Monday.com (survives code updates)
-- Reads Discord link preview embeds for URL context
+Srele is a full-power AI assistant powered by Claude Opus.
+- Chats and answers any question (as smart as Claude gets)
+- Writes code in any language
+- Saves ideas/tasks to Monday.com when asked
+- Persistent memory in learnings.json (survives code updates)
+- Reads images, screenshots, Discord embeds, and URLs
+- Reads full channel history for context
+- Summarizes conversations
+- Can modify its own code and push to GitHub (with confirmation)
 """
 
 import os
@@ -29,10 +33,16 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+
+GITHUB_REPO = "visionviral/srele_idea_bot"
+GITHUB_BRANCH = "main"
 
 MONDAY_BOARD_ID = 5089081467
 MONDAY_GROUP_ID = "group_mm1m2py5"       # SRELE IDEAS group
 MONDAY_API_URL = "https://api.monday.com/v2"
+
+CLAUDE_MODEL = "claude-opus-4-6"
 
 COL_PRIORITY = "status"
 COL_DATE_ADDED = "datum"
@@ -43,42 +53,49 @@ PRIORITY_WORKING_ON_IT = 0
 PRIORITY_DONE = 1
 
 # Srele's system prompt — built dynamically with learnings
-SRELE_SYSTEM_BASE = """You are Srele, a friendly and helpful AI assistant for the React Biome Discord server.
+SRELE_SYSTEM_BASE = """You are Srele, a powerful AI assistant for the React Biome Discord server. You run on Claude Opus — the most capable AI model available.
 
-You chat naturally about anything — content ideas, business strategy, tech questions, creative brainstorming, or casual conversation. You're witty, direct, and helpful.
+You are an expert in EVERYTHING — coding, business strategy, content creation, marketing, design, data analysis, writing, brainstorming, and more. You give thorough, smart, actionable answers. You write production-quality code. You think deeply before responding.
 
-IMPORTANT — SAVING IDEAS TO MONDAY.COM:
-You have the ability to save ideas/tasks to the team's Monday.com board. But you should ONLY do this when the user EXPLICITLY asks you to save, add, or track something. Look for phrases like:
-- "save this", "add this", "put this on the board"
-- "add to to-do", "add to monday", "track this"
-- "make a task for", "create a task", "save as idea"
-- "put this as an idea", "log this", "note this down"
-- "remember this as a task"
+You are direct, witty, and confident. You don't hedge or give wishy-washy answers. If you know something, say it clearly.
 
-If the user is just chatting, brainstorming, or asking questions — DO NOT save anything. Just have a normal conversation.
+YOUR CAPABILITIES:
+1. Normal conversation — chat about anything, answer any question
+2. Code generation — write code in any language, debug, explain, refactor
+3. Save ideas/tasks to Monday.com — when explicitly asked
+4. Learn and remember — permanently store things users teach you
+5. Self-modify — you can update your own code (bot.py) and push to GitHub
+6. Read images/screenshots — analyze anything visual
+7. Read channel history — you always know what's been discussed
+8. Summarize conversations — give recaps of channel discussions
 
-When you DO need to save something, respond with a JSON block in this exact format on its own line:
+SAVING IDEAS TO MONDAY.COM:
+Only save when the user EXPLICITLY asks (e.g. "save this", "add to to-do", "track this", "put this as an idea").
+When saving, output at the END of your message:
 SAVE_IDEA:{"idea": "<the full idea text>", "priority": "normal"}
+Set priority to "high" only if marked urgent/important/asap/critical.
 
-Set priority to "high" only if the user says it's urgent/important/high priority/asap/critical.
-Set priority to "normal" for everything else.
-
-Place the SAVE_IDEA line at the END of your message, after your conversational response.
-
-IMPORTANT — LEARNING NEW THINGS:
-Users can teach you things by saying phrases like:
-- "learn this:", "remember that:", "from now on:"
-- "when I say X, do Y", "always do X when..."
-
-When a user teaches you something, respond with a JSON block in this exact format on its own line:
+LEARNING NEW THINGS:
+When users teach you something ("learn this:", "remember that:", "from now on:", "when I say X do Y"):
+Output at the END of your message:
 SAVE_LEARNING:{"learning": "<what you learned, written as a clear instruction>"}
 
-Place the SAVE_LEARNING line at the END of your message, after your conversational confirmation.
-Do NOT also output SAVE_IDEA when learning — these are separate actions.
+MODIFYING YOUR OWN CODE:
+When users ask you to add features, fix bugs, or change your behavior by modifying code:
+- Write the complete updated code
+- Show it in a code block so they can review it
+- Ask them to confirm with "push it" or "deploy it"
+- When they confirm, output at the END of your message:
+PUSH_CODE:{"file": "<filename>", "content": "<the full file content>", "commit_message": "<short description of change>"}
+- You can modify: bot.py, requirements.txt, learnings.json, or create new files
+- NEVER push code without showing it first and getting confirmation
+- IMPORTANT: When modifying bot.py, include the COMPLETE file content, not just the changed parts
 
-If the user just says something like "save this" without context, ask them what they want to save.
-
-Keep your responses concise — you're in a Discord chat, not writing an essay. A few sentences is usually enough."""
+RULES:
+- Only output ONE command per message (SAVE_IDEA, SAVE_LEARNING, or PUSH_CODE — never combine them)
+- Place the command at the END, after your conversational response
+- For Discord, keep chat responses reasonably concise but don't sacrifice quality
+- For code and technical answers, be as thorough as needed"""
 
 # Per-channel conversation history (keeps last messages for context)
 conversation_history = {}
@@ -236,6 +253,49 @@ def add_item_update(item_id, body_text):
 
 
 # ============================================================
+# GITHUB API — self-modification (push code changes)
+# ============================================================
+
+def github_push_file(file_path, content, commit_message):
+    """Push a file to the GitHub repo. Returns True on success."""
+    if not GITHUB_TOKEN:
+        print("No GITHUB_TOKEN set — cannot push")
+        return False, "No GitHub token configured. Add GITHUB_TOKEN to Railway env vars."
+
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    # Get the current file's SHA (needed for updates)
+    resp = requests.get(api_url, headers=headers, params={"ref": GITHUB_BRANCH})
+    sha = None
+    if resp.status_code == 200:
+        sha = resp.json().get("sha")
+
+    import base64
+    encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+
+    payload = {
+        "message": commit_message,
+        "content": encoded_content,
+        "branch": GITHUB_BRANCH,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    resp = requests.put(api_url, headers=headers, json=payload)
+    if resp.status_code in (200, 201):
+        print(f"Pushed {file_path} to GitHub: {commit_message}")
+        return True, f"Pushed `{file_path}` to GitHub. Railway will auto-deploy."
+    else:
+        error = resp.json().get("message", resp.text[:100])
+        print(f"GitHub push failed: {error}")
+        return False, f"GitHub push failed: {error}"
+
+
+# ============================================================
 # SRELE MEMORY — persistent learnings in learnings.json
 # This file is SEPARATE from bot.py. Never touch bot.py for memory.
 # Learnings survive all code updates because they live in their own file.
@@ -310,7 +370,7 @@ claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 def generate_item_name(raw_idea):
     """Use Claude to generate a short item name (max 15 words) from a raw idea."""
     message = claude_client.messages.create(
-        model="claude-sonnet-4-6",
+        model=CLAUDE_MODEL,
         max_tokens=100,
         system="Generate a short, clear item name (MAXIMUM 15 words) for a task/idea. Just return the name, nothing else. No quotes, no explanation.",
         messages=[{"role": "user", "content": raw_idea}],
@@ -402,8 +462,8 @@ def chat_with_claude(channel_id, user_name, user_message, embed_context="", imag
         conversation_history[channel_id] = history
 
     message = claude_client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
+        model=CLAUDE_MODEL,
+        max_tokens=4096,
         system=build_system_prompt(),
         messages=history,
     )
@@ -446,6 +506,24 @@ def parse_learning_command(response_text):
         return response_text, None
 
 
+def parse_push_command(response_text):
+    """Check if Claude's response contains a PUSH_CODE command."""
+    match = re.search(r'PUSH_CODE:(\{.*\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+
+    try:
+        push_data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, push_data
+    except json.JSONDecodeError:
+        return response_text, None
+
+
+# Pending code pushes waiting for user confirmation (channel_id -> push_data)
+pending_pushes = {}
+
+
 # ============================================================
 # CHANNEL HISTORY — read recent messages for context
 # ============================================================
@@ -486,7 +564,7 @@ async def fetch_channel_history_for_summary(channel, limit=200):
 def summarize_with_claude(messages_text):
     """Use Claude to summarize a channel's conversation."""
     message = claude_client.messages.create(
-        model="claude-sonnet-4-6",
+        model=CLAUDE_MODEL,
         max_tokens=2000,
         system="You are summarizing a Discord channel conversation. Give a clear, organized summary with:\n1. Main topics discussed\n2. Key decisions or conclusions\n3. Action items or ideas mentioned\n4. Notable disagreements or open questions\n\nBe concise but thorough. Use bullet points. Don't include every message — focus on what matters.",
         messages=[{"role": "user", "content": f"Summarize this conversation:\n\n{messages_text}"}],
@@ -530,6 +608,35 @@ async def on_message(message):
     if bot.user not in message.mentions:
         await bot.process_commands(message)
         return
+
+    # Check for push confirmation (user says "push it", "deploy it", etc.)
+    channel_key = str(message.channel.id)
+    msg_lower = message.content.lower()
+    push_confirms = ["push it", "deploy it", "do it", "yes push", "yes deploy", "go ahead", "ship it"]
+    push_cancels = ["cancel", "don't push", "nevermind", "nah", "no"]
+
+    if channel_key in pending_pushes:
+        push_data = pending_pushes[channel_key]
+
+        if any(confirm in msg_lower for confirm in push_confirms):
+            del pending_pushes[channel_key]
+            async with message.channel.typing():
+                file_name = push_data.get("file", "bot.py")
+                content = push_data.get("content", "")
+                commit_msg = push_data.get("commit_message", "Update from Srele")
+
+                success, result_msg = github_push_file(file_name, content, commit_msg)
+                if success:
+                    await message.reply(f"Pushed `{file_name}` to GitHub. Railway will auto-deploy in ~30 seconds.")
+                    await message.add_reaction("\U0001f680")  # rocket
+                else:
+                    await message.reply(f"Push failed: {result_msg}")
+            return
+
+        elif any(cancel in msg_lower for cancel in push_cancels):
+            del pending_pushes[channel_key]
+            await message.reply("Got it, cancelled the push.")
+            return
 
     # Remove the bot mention to get the actual message
     raw_text = message.content
@@ -651,6 +758,30 @@ async def on_message(message):
                         await message.reply(display_text or "Got it, but I had trouble saving that to my memory. Try again?")
                 else:
                     await message.reply(display_text or "I didn't catch what to learn. Could you rephrase?")
+                return
+
+            # Check for push code command
+            display_text, push_data = parse_push_command(display_text)
+            if push_data:
+                # Store pending push and ask for confirmation
+                pending_pushes[str(message.channel.id)] = push_data
+                file_name = push_data.get("file", "bot.py")
+                commit_msg = push_data.get("commit_message", "Update")
+
+                # Send the conversational reply (which includes the code preview)
+                if display_text:
+                    if len(display_text) <= 2000:
+                        await message.reply(display_text)
+                    else:
+                        chunks = [display_text[i:i+2000] for i in range(0, len(display_text), 2000)]
+                        await message.reply(chunks[0])
+                        for chunk in chunks[1:]:
+                            await message.channel.send(chunk)
+
+                await message.channel.send(
+                    f"**Ready to push `{file_name}`** — \"{commit_msg}\"\n\n"
+                    f"Say **\"push it\"** to deploy or **\"cancel\"** to abort."
+                )
                 return
 
             # Check for save idea command
