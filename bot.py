@@ -398,29 +398,74 @@ def generate_item_name(raw_idea):
     return name
 
 
-def chat_with_claude(channel_id, user_name, user_message, embed_context=""):
+def fetch_image_as_base64(url):
+    """Download an image and return it as base64 with its media type."""
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+
+        content_type = resp.headers.get("Content-Type", "image/png")
+        # Normalize content type
+        if "jpeg" in content_type or "jpg" in content_type:
+            media_type = "image/jpeg"
+        elif "png" in content_type:
+            media_type = "image/png"
+        elif "gif" in content_type:
+            media_type = "image/gif"
+        elif "webp" in content_type:
+            media_type = "image/webp"
+        else:
+            media_type = "image/png"
+
+        import base64
+        image_data = base64.standard_b64encode(resp.content).decode("utf-8")
+        return image_data, media_type
+
+    except Exception as e:
+        print(f"Could not fetch image {url}: {e}")
+        return None, None
+
+
+def chat_with_claude(channel_id, user_name, user_message, embed_context="", image_urls=None):
     """Send a message to Claude with conversation history and return the response."""
     if channel_id not in conversation_history:
         conversation_history[channel_id] = []
 
     history = conversation_history[channel_id]
 
-    # Build message with all available context
-    message_content = f"[{user_name}]: {user_message}"
+    # Build the text part of the message
+    text_content = f"[{user_name}]: {user_message}"
 
-    # Use Discord embed data first (most reliable — Discord already fetched the preview)
     if embed_context:
-        message_content += f"\n\n--- Link preview from Discord ---\n{embed_context}"
+        text_content += f"\n\n--- Link preview from Discord ---\n{embed_context}"
     else:
-        # Fall back to fetching URLs directly
         url_context = extract_url_context(user_message)
         if url_context:
-            message_content += f"\n\n--- Fetched link content ---\n{url_context}"
+            text_content += f"\n\n--- Fetched link content ---\n{url_context}"
 
-    history.append({
-        "role": "user",
-        "content": message_content,
-    })
+    # Build message content — text only or multimodal (text + images)
+    if image_urls:
+        content_blocks = []
+
+        # Add images first
+        for img_url in image_urls[:4]:  # Max 4 images
+            img_data, media_type = fetch_image_as_base64(img_url)
+            if img_data:
+                content_blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": img_data,
+                    },
+                })
+
+        # Add text after images
+        content_blocks.append({"type": "text", "text": text_content})
+
+        history.append({"role": "user", "content": content_blocks})
+    else:
+        history.append({"role": "user", "content": text_content})
 
     # Trim history if too long
     if len(history) > MAX_HISTORY:
@@ -516,14 +561,25 @@ async def on_message(message):
         raw_text = raw_text.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
     raw_text = raw_text.strip()
 
-    if not raw_text:
+    # Extract image URLs from attachments
+    image_urls = []
+    for attachment in message.attachments:
+        if attachment.content_type and attachment.content_type.startswith("image/"):
+            image_urls.append(attachment.url)
+
+    if not raw_text and not image_urls:
         await message.reply(
             "Hey! I'm **Srele** — your AI assistant for React Biome.\n\n"
             "Just tag me and chat about anything. If you want me to save an idea or task "
             "to Monday.com, just ask!\n\n"
-            "You can also teach me things — just say *\"learn this: ...\"* and I'll remember it forever."
+            "You can also send me images/screenshots and I'll tell you what I see.\n"
+            "Teach me things with *\"learn this: ...\"* and I'll remember forever."
         )
         return
+
+    # If only images, no text — set a default prompt
+    if not raw_text and image_urls:
+        raw_text = "What's in this image?"
 
     # If message has URLs but no embeds yet, wait briefly for Discord to generate them
     has_urls = URL_PATTERN.search(raw_text)
@@ -562,6 +618,7 @@ async def on_message(message):
                 message.author.display_name,
                 raw_text,
                 embed_context=embed_context,
+                image_urls=image_urls if image_urls else None,
             )
 
             # Check for learning command first
