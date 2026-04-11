@@ -2,9 +2,10 @@
 Srele — AI Assistant for the React Biome Discord Server
 
 Srele is a conversational AI assistant powered by Claude.
-When users explicitly ask to save an idea/task, Srele creates
-an item on the Monday.com To-Dos board in the SRELE IDEAS group.
-Otherwise, Srele just chats normally.
+- Chats normally by default
+- Saves ideas/tasks to Monday.com when explicitly asked
+- Persistent memory: learnings stored on Monday.com (survives code updates)
+- Reads Discord link preview embeds for URL context
 """
 
 import os
@@ -30,7 +31,8 @@ MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 MONDAY_BOARD_ID = 5089081467
-MONDAY_GROUP_ID = "group_mm1m2py5"
+MONDAY_GROUP_ID = "group_mm1m2py5"       # SRELE IDEAS group
+MONDAY_MEMORY_GROUP = "srele_memory"      # Will be created on first use
 MONDAY_API_URL = "https://api.monday.com/v2"
 
 COL_PRIORITY = "status"
@@ -41,8 +43,8 @@ PRIORITY_TO_BE_MADE = 2
 PRIORITY_WORKING_ON_IT = 0
 PRIORITY_DONE = 1
 
-# Srele's system prompt — conversational AI + idea saving capability
-SRELE_SYSTEM = """You are Srele, a friendly and helpful AI assistant for the React Biome Discord server.
+# Srele's system prompt — built dynamically with learnings
+SRELE_SYSTEM_BASE = """You are Srele, a friendly and helpful AI assistant for the React Biome Discord server.
 
 You chat naturally about anything — content ideas, business strategy, tech questions, creative brainstorming, or casual conversation. You're witty, direct, and helpful.
 
@@ -62,7 +64,18 @@ SAVE_IDEA:{"idea": "<the full idea text>", "priority": "normal"}
 Set priority to "high" only if the user says it's urgent/important/high priority/asap/critical.
 Set priority to "normal" for everything else.
 
-Place the SAVE_IDEA line at the END of your message, after your conversational response. You can still chat normally before it.
+Place the SAVE_IDEA line at the END of your message, after your conversational response.
+
+IMPORTANT — LEARNING NEW THINGS:
+Users can teach you things by saying phrases like:
+- "learn this:", "remember that:", "from now on:"
+- "when I say X, do Y", "always do X when..."
+
+When a user teaches you something, respond with a JSON block in this exact format on its own line:
+SAVE_LEARNING:{"learning": "<what you learned, written as a clear instruction>"}
+
+Place the SAVE_LEARNING line at the END of your message, after your conversational confirmation.
+Do NOT also output SAVE_IDEA when learning — these are separate actions.
 
 If the user just says something like "save this" without context, ask them what they want to save.
 
@@ -72,8 +85,11 @@ Keep your responses concise — you're in a Discord chat, not writing an essay. 
 conversation_history = {}
 MAX_HISTORY = 20
 
+# Cached learnings from Monday.com (loaded on startup, updated live)
+srele_learnings = []
+
 # ============================================================
-# URL FETCHING — extract info from links
+# URL FETCHING — extract info from links (fallback)
 # ============================================================
 
 URL_PATTERN = re.compile(r'https?://\S+')
@@ -90,18 +106,15 @@ def fetch_url_context(url):
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Extract Open Graph / meta info
         title = None
         description = None
 
-        # Try og:title first, then <title>
         og_title = soup.find("meta", property="og:title")
         if og_title and og_title.get("content"):
             title = og_title["content"]
         elif soup.title and soup.title.string:
             title = soup.title.string.strip()
 
-        # Try og:description, then meta description
         og_desc = soup.find("meta", property="og:description")
         if og_desc and og_desc.get("content"):
             description = og_desc["content"]
@@ -132,7 +145,7 @@ def extract_url_context(text):
         return ""
 
     context_parts = []
-    for url in urls[:3]:  # Limit to 3 URLs max
+    for url in urls[:3]:
         info = fetch_url_context(url)
         if info:
             context_parts.append(f"[Content from {url}]\n{info}")
@@ -166,7 +179,7 @@ def monday_request(query, variables=None):
     return data
 
 
-def create_monday_item(item_name, priority_label_id=PRIORITY_TO_BE_MADE):
+def create_monday_item(item_name, priority_label_id=PRIORITY_TO_BE_MADE, group_id=None):
     today = datetime.date.today().isoformat()
 
     column_values = json.dumps({
@@ -190,7 +203,7 @@ def create_monday_item(item_name, priority_label_id=PRIORITY_TO_BE_MADE):
 
     variables = {
         "boardId": str(MONDAY_BOARD_ID),
-        "groupId": MONDAY_GROUP_ID,
+        "groupId": group_id or MONDAY_GROUP_ID,
         "itemName": item_name,
         "columnValues": column_values,
     }
@@ -218,6 +231,148 @@ def add_item_update(item_id, body_text):
 
     result = monday_request(query, variables)
     return result["data"]["create_update"]
+
+
+# ============================================================
+# SRELE MEMORY — persistent learnings on Monday.com
+# ============================================================
+
+def ensure_memory_group():
+    """Create the SRELE MEMORY group on the board if it doesn't exist."""
+    try:
+        # Check if group exists
+        query = """
+        query ($boardId: [ID!]!) {
+            boards(ids: $boardId) {
+                groups {
+                    id
+                    title
+                }
+            }
+        }
+        """
+        result = monday_request(query, {"boardId": [str(MONDAY_BOARD_ID)]})
+        groups = result["data"]["boards"][0]["groups"]
+
+        for g in groups:
+            if g["id"] == MONDAY_MEMORY_GROUP:
+                return True
+
+        # Create the group
+        query = """
+        mutation ($boardId: ID!, $groupName: String!, $groupId: String!) {
+            create_group(
+                board_id: $boardId,
+                group_name: $groupName,
+                group_id: $groupId
+            ) {
+                id
+            }
+        }
+        """
+        monday_request(query, {
+            "boardId": str(MONDAY_BOARD_ID),
+            "groupName": "SRELE MEMORY",
+            "groupId": MONDAY_MEMORY_GROUP,
+        })
+        print("Created SRELE MEMORY group on Monday.com")
+        return True
+
+    except Exception as e:
+        print(f"Could not ensure memory group: {e}")
+        return False
+
+
+def load_learnings():
+    """Load all learnings from the SRELE MEMORY group on Monday.com."""
+    global srele_learnings
+    try:
+        query = """
+        query ($boardId: [ID!]!) {
+            boards(ids: $boardId) {
+                groups(ids: ["srele_memory"]) {
+                    items_page(limit: 100) {
+                        items {
+                            id
+                            name
+                        }
+                    }
+                }
+            }
+        }
+        """
+        result = monday_request(query, {"boardId": [str(MONDAY_BOARD_ID)]})
+        groups = result["data"]["boards"][0]["groups"]
+
+        if not groups:
+            srele_learnings = []
+            return
+
+        items = groups[0]["items_page"]["items"]
+        srele_learnings = [item["name"] for item in items]
+        print(f"Loaded {len(srele_learnings)} learnings from Monday.com")
+
+    except Exception as e:
+        print(f"Could not load learnings: {e}")
+        srele_learnings = []
+
+
+def save_learning(learning_text, taught_by=""):
+    """Save a new learning to the SRELE MEMORY group on Monday.com."""
+    global srele_learnings
+    try:
+        ensure_memory_group()
+
+        # Create item with just the name (the learning itself)
+        query = """
+        mutation ($boardId: ID!, $groupId: String!, $itemName: String!) {
+            create_item(
+                board_id: $boardId,
+                group_id: $groupId,
+                item_name: $itemName
+            ) {
+                id
+                name
+            }
+        }
+        """
+        variables = {
+            "boardId": str(MONDAY_BOARD_ID),
+            "groupId": MONDAY_MEMORY_GROUP,
+            "itemName": learning_text,
+        }
+
+        result = monday_request(query, variables)
+        item_id = result["data"]["create_item"]["id"]
+
+        # Add a comment with who taught this and when
+        if taught_by:
+            update_body = (
+                f"<strong>Taught by:</strong> {taught_by}\n"
+                f"<strong>Date:</strong> {datetime.datetime.now().strftime('%B %d, %Y at %I:%M %p')}"
+            )
+            add_item_update(item_id, update_body)
+
+        # Update local cache
+        srele_learnings.append(learning_text)
+        print(f"Saved learning: \"{learning_text}\"")
+        return True
+
+    except Exception as e:
+        print(f"Could not save learning: {e}")
+        return False
+
+
+def build_system_prompt():
+    """Build the full system prompt including any learnings."""
+    prompt = SRELE_SYSTEM_BASE
+
+    if srele_learnings:
+        prompt += "\n\nIMPORTANT — THINGS YOU HAVE LEARNED (always follow these):\n"
+        for i, learning in enumerate(srele_learnings, 1):
+            prompt += f"{i}. {learning}\n"
+
+    return prompt
 
 
 # ============================================================
@@ -275,7 +430,7 @@ def chat_with_claude(channel_id, user_name, user_message, embed_context=""):
     message = claude_client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
-        system=SRELE_SYSTEM,
+        system=build_system_prompt(),
         messages=history,
     )
 
@@ -290,16 +445,29 @@ def chat_with_claude(channel_id, user_name, user_message, embed_context=""):
 
 
 def parse_save_command(response_text):
-    """Check if Claude's response contains a SAVE_IDEA command. Returns (clean_text, idea_data) or (text, None)."""
+    """Check if Claude's response contains a SAVE_IDEA command."""
     match = re.search(r'SAVE_IDEA:(\{.*?\})', response_text, re.DOTALL)
     if not match:
         return response_text, None
 
     try:
         idea_data = json.loads(match.group(1))
-        # Remove the SAVE_IDEA line from the display text
         clean_text = response_text[:match.start()].rstrip()
         return clean_text, idea_data
+    except json.JSONDecodeError:
+        return response_text, None
+
+
+def parse_learning_command(response_text):
+    """Check if Claude's response contains a SAVE_LEARNING command."""
+    match = re.search(r'SAVE_LEARNING:(\{.*?\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+
+    try:
+        learning_data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, learning_data
     except json.JSONDecodeError:
         return response_text, None
 
@@ -317,9 +485,13 @@ bot = commands.Bot(command_prefix="!srele ", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"\n✅ Srele is online as {bot.user} (ID: {bot.user.id})")
-    print(f"📋 Monday.com board: {MONDAY_BOARD_ID}")
-    print(f"🎯 Listening for @Srele mentions...\n")
+    print(f"\n Srele is online as {bot.user} (ID: {bot.user.id})")
+    print(f" Monday.com board: {MONDAY_BOARD_ID}")
+    print(f" Listening for @Srele mentions...\n")
+
+    # Load learnings from Monday.com on startup
+    ensure_memory_group()
+    load_learnings()
 
     await bot.change_presence(
         activity=discord.Activity(
@@ -348,7 +520,8 @@ async def on_message(message):
         await message.reply(
             "Hey! I'm **Srele** — your AI assistant for React Biome.\n\n"
             "Just tag me and chat about anything. If you want me to save an idea or task "
-            "to Monday.com, just ask! (e.g. *\"@Srele save this idea: podcast about morning routines\"*)"
+            "to Monday.com, just ask!\n\n"
+            "You can also teach me things — just say *\"learn this: ...\"* and I'll remember it forever."
         )
         return
 
@@ -356,7 +529,6 @@ async def on_message(message):
     has_urls = URL_PATTERN.search(raw_text)
     if has_urls and not message.embeds:
         await asyncio.sleep(2)
-        # Re-fetch the message to get embeds Discord may have added
         try:
             message = await message.channel.fetch_message(message.id)
         except Exception:
@@ -384,7 +556,7 @@ async def on_message(message):
 
     async with message.channel.typing():
         try:
-            # Get Claude's response (conversational + possible save command)
+            # Get Claude's response
             response = chat_with_claude(
                 str(message.channel.id),
                 message.author.display_name,
@@ -392,11 +564,26 @@ async def on_message(message):
                 embed_context=embed_context,
             )
 
-            # Check if Claude wants to save an idea
-            display_text, idea_data = parse_save_command(response)
+            # Check for learning command first
+            display_text, learning_data = parse_learning_command(response)
+            if learning_data:
+                learning_text = learning_data.get("learning", "")
+                if learning_text:
+                    saved = save_learning(learning_text, taught_by=message.author.display_name)
+                    if saved:
+                        if display_text:
+                            await message.reply(display_text)
+                        await message.add_reaction("\U0001f9e0")  # brain emoji
+                    else:
+                        await message.reply(display_text or "Got it, but I had trouble saving that to my memory. Try again?")
+                else:
+                    await message.reply(display_text or "I didn't catch what to learn. Could you rephrase?")
+                return
+
+            # Check for save idea command
+            display_text, idea_data = parse_save_command(display_text)
 
             if idea_data:
-                # Claude detected a save request — create the Monday.com item
                 idea_text = idea_data.get("idea", raw_text)
                 priority = idea_data.get("priority", "normal")
                 priority_id = PRIORITY_WORKING_ON_IT if priority == "high" else PRIORITY_TO_BE_MADE
@@ -405,7 +592,6 @@ async def on_message(message):
                 item = create_monday_item(item_name, priority_id)
                 item_id = item["id"]
 
-                # Add full details as a comment on the Monday item
                 discord_link = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{message.id}"
                 update_body = (
                     f"<strong>Original idea from Discord</strong>\n\n"
@@ -427,11 +613,9 @@ async def on_message(message):
                     PRIORITY_DONE: "Done",
                 }
 
-                # Send the conversational reply first
                 if display_text:
                     await message.reply(display_text)
 
-                # Then send the save confirmation as an embed
                 embed = discord.Embed(
                     title="Idea Saved!",
                     description=f"**{item_name}**",
@@ -443,12 +627,11 @@ async def on_message(message):
                 embed.set_footer(text=f"Saved by {message.author.display_name}")
 
                 await message.channel.send(embed=embed)
-                await message.add_reaction("✅")
+                await message.add_reaction("\u2705")
 
                 print(f"Saved: \"{item_name}\" (ID: {item_id}) by {message.author.name}")
             else:
                 # Normal conversation — just reply
-                # Split long responses for Discord's 2000 char limit
                 if len(display_text) <= 2000:
                     await message.reply(display_text)
                 else:
@@ -582,6 +765,32 @@ async def slash_idea_list(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"Couldn't fetch ideas: `{str(e)[:100]}`")
         print(f"idea-list error: {e}")
+
+
+@bot.tree.command(name="srele-memory", description="Show what Srele has learned")
+async def slash_memory(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        load_learnings()  # Refresh from Monday.com
+
+        if not srele_learnings:
+            await interaction.followup.send("I haven't learned anything yet! Teach me by saying `@Srele learn this: ...`")
+            return
+
+        embed = discord.Embed(title="Srele's Memory", color=0x9d50dd)
+
+        for i, learning in enumerate(srele_learnings, 1):
+            # Truncate long learnings for display
+            display = learning if len(learning) <= 100 else learning[:97] + "..."
+            embed.add_field(name=f"#{i}", value=display, inline=False)
+
+        embed.set_footer(text=f"{len(srele_learnings)} learnings stored on Monday.com")
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(f"Couldn't fetch memory: `{str(e)[:100]}`")
+        print(f"memory error: {e}")
 
 
 # ============================================================
