@@ -94,6 +94,9 @@ PUSH_CODE:{"file": "<filename>", "content": "<the full file content>", "commit_m
 - IMPORTANT: When modifying bot.py, include the COMPLETE file content, not just the changed parts
 
 CRITICAL SAFETY RULES FOR CODE CHANGES:
+- BEFORE making ANY code change, you MUST first read the current file. Output:
+  READ_CODE:{"file": "bot.py"}
+  The bot will fetch the file from GitHub and show it to you. WAIT for the code to come back before writing changes.
 - NEVER rewrite bot.py from scratch or from memory. You MUST keep the existing code structure.
 - ONLY add, remove, or change the specific parts needed for the requested feature.
 - NEVER change environment variable names. The correct names are:
@@ -102,7 +105,17 @@ CRITICAL SAFETY RULES FOR CODE CHANGES:
 - NEVER remove existing features when adding new ones
 - NEVER change the Claude model from claude-opus-4-6
 - NEVER add new pip dependencies without also updating requirements.txt
-- If you are unsure about the current code structure, tell the user you need to see the current bot.py first rather than guessing
+- If you can't read the current code for any reason, tell the user and DO NOT guess
+
+WORKFLOW FOR LEARNING NEW SKILLS (code changes):
+1. User tells you something doesn't work or asks for a new feature
+2. You output READ_CODE:{"file": "bot.py"} to see your current code
+3. The bot shows you the code
+4. You identify exactly what needs to change
+5. You make ONLY the targeted changes, keeping everything else identical
+6. You show the complete updated file to the user
+7. User says "push it" → you output PUSH_CODE to deploy
+8. You confirm: "I just learned [skill]. Now I can [capability]."
 
 SENDING MESSAGES TO OTHER CHANNELS:
 When a user asks you to send a message to another channel or @mention someone:
@@ -317,6 +330,25 @@ def github_push_file(file_path, content, commit_message):
         error = resp.json().get("message", resp.text[:100])
         print(f"GitHub push failed: {error}")
         return False, f"GitHub push failed: {error}"
+
+
+def github_read_file(file_path):
+    """Read a file from the GitHub repo. Returns the file content or None."""
+    if not GITHUB_TOKEN:
+        return None
+
+    import base64
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    resp = requests.get(api_url, headers=headers, params={"ref": GITHUB_BRANCH})
+    if resp.status_code == 200:
+        content_b64 = resp.json().get("content", "")
+        return base64.b64decode(content_b64).decode("utf-8")
+    return None
 
 
 # ============================================================
@@ -554,6 +586,20 @@ def parse_send_message_command(response_text):
         send_data = json.loads(match.group(1))
         clean_text = response_text[:match.start()].rstrip()
         return clean_text, send_data
+    except json.JSONDecodeError:
+        return response_text, None
+
+
+def parse_read_code_command(response_text):
+    """Check if Claude's response contains a READ_CODE command."""
+    match = re.search(r'READ_CODE:(\{.*?\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+
+    try:
+        read_data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, read_data
     except json.JSONDecodeError:
         return response_text, None
 
@@ -801,6 +847,53 @@ async def on_message(message):
                 image_urls=image_urls if image_urls else None,
                 channel_context=channel_context,
             )
+
+            # Check for READ_CODE first — Srele wants to see its own code
+            display_text, read_data = parse_read_code_command(response)
+            if read_data:
+                file_to_read = read_data.get("file", "bot.py")
+                if display_text:
+                    await message.reply(display_text)
+
+                code_content = github_read_file(file_to_read)
+                if code_content:
+                    # Feed the code back to Claude so it can make informed changes
+                    await message.channel.send(f"Reading `{file_to_read}` from GitHub...")
+                    followup = chat_with_claude(
+                        str(message.channel.id),
+                        "SYSTEM",
+                        f"Here is the current content of {file_to_read}:\n\n```python\n{code_content}\n```\n\nNow make the targeted changes the user requested. Remember: keep everything else identical, only change what's needed.",
+                    )
+
+                    # Process the followup response for PUSH_CODE
+                    followup_text, push_data = parse_push_command(followup)
+                    if push_data:
+                        pending_pushes[str(message.channel.id)] = push_data
+                        file_name = push_data.get("file", "bot.py")
+                        commit_msg = push_data.get("commit_message", "Update")
+
+                        if followup_text:
+                            if len(followup_text) <= 2000:
+                                await message.channel.send(followup_text)
+                            else:
+                                chunks = [followup_text[i:i+2000] for i in range(0, len(followup_text), 2000)]
+                                for chunk in chunks:
+                                    await message.channel.send(chunk)
+
+                        await message.channel.send(
+                            f"**Ready to push `{file_name}`** — \"{commit_msg}\"\n\n"
+                            f"Say **\"push it\"** to deploy or **\"cancel\"** to abort."
+                        )
+                    else:
+                        if len(followup_text) <= 2000:
+                            await message.channel.send(followup_text)
+                        else:
+                            chunks = [followup_text[i:i+2000] for i in range(0, len(followup_text), 2000)]
+                            for chunk in chunks:
+                                await message.channel.send(chunk)
+                else:
+                    await message.channel.send(f"Couldn't read `{file_to_read}` from GitHub. Check if GITHUB_TOKEN is set.")
+                return
 
             # Check for learning command first
             display_text, learning_data = parse_learning_command(response)
