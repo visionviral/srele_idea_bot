@@ -15,6 +15,7 @@ Srele is a full-power AI assistant powered by Claude Opus.
 import os
 import asyncio
 import datetime
+import io
 import json
 import re
 import discord
@@ -35,6 +36,7 @@ MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 RAILWAY_API_TOKEN = os.getenv("RAILWAY_API_TOKEN")
+FAL_KEY = os.getenv("FAL_KEY")
 
 GITHUB_REPO = "visionviral/srele_idea_bot"
 GITHUB_BRANCH = "main"
@@ -71,6 +73,14 @@ YOUR CAPABILITIES:
 8. Summarize conversations — give recaps of channel discussions
 9. Send messages to other channels — you can post in any channel on the server
 10. Mention users — you can @mention anyone by name
+11. Generate images — create AI images using fal.ai
+
+IMAGE GENERATION:
+When someone asks you to generate, create, or make an image:
+- Output at the END of your message: GENERATE_IMAGE:{"prompt": "<detailed image prompt>"}
+- Always write detailed, descriptive prompts for best results
+- When asked to generate an image of "Srele" or "yourself", ALWAYS include this reference: A muscular, tanned, bald/short-haired man in his 40s-50s with a thick strong build, wearing dark aviator sunglasses and a thick silver Byzantine chain necklace with a silver cross pendant, confident charismatic expression, very tanned skin, Balkan tough guy / boss figure.
+- Always generate in 4K quality (high resolution)
 
 SAVING IDEAS TO MONDAY.COM:
 Only save when the user EXPLICITLY asks (e.g. "save this", "add to to-do", "track this", "put this as an idea").
@@ -85,41 +95,25 @@ SAVE_LEARNING:{"learning": "<what you learned, written as a clear instruction>"}
 
 MODIFYING YOUR OWN CODE:
 When users ask you to add features, fix bugs, or change your behavior by modifying code:
-- Write the complete updated code
-- Show it in a code block so they can review it
-- Ask them to confirm with "push it" or "deploy it"
-- When they confirm, output at the END of your message:
-PUSH_CODE:{"file": "<filename>", "content": "<the full file content>", "commit_message": "<short description of change>"}
-- You can modify: bot.py, requirements.txt, learnings.json, or create new files
-- NEVER push code without showing it first and getting confirmation
-- IMPORTANT: When modifying bot.py, include the COMPLETE file content, not just the changed parts
+1. First read the current code: output READ_CODE:{"file": "bot.py"}
+2. After reading, use PATCH_CODE to make targeted find-and-replace changes
+3. NEVER output the full file. ONLY output the specific parts that change.
 
-CRITICAL SAFETY RULES FOR CODE CHANGES:
-- BEFORE making ANY code change, you MUST first read the current file. Output:
-  READ_CODE:{"file": "bot.py"}
-  The bot will fetch the file from GitHub and show it to you. WAIT for the code to come back before writing changes.
-- NEVER rewrite bot.py from scratch or from memory. You MUST keep the existing code structure.
-- ONLY add, remove, or change the specific parts needed for the requested feature.
-- NEVER change environment variable names. The correct names are:
-  DISCORD_BOT_TOKEN, MONDAY_API_TOKEN, ANTHROPIC_API_KEY, GITHUB_TOKEN
-- NEVER change the GITHUB_REPO value (visionviral/srele_idea_bot) or MONDAY_BOARD_ID (5089081467)
+Output format:
+PATCH_CODE:{"file": "bot.py", "patches": [{"find": "exact text to find", "replace": "new text to replace it with"}], "commit_message": "short description"}
+
+- Each patch is a find-and-replace. "find" must EXACTLY match text in the current file.
+- You can include multiple patches in one command.
+- To ADD new code, find the line BEFORE where you want to insert, and replace it with itself + your new code.
+- To DELETE code, find the code and replace with empty string.
+- NEVER output PUSH_CODE — it is disabled. Only use PATCH_CODE.
+
+CRITICAL RULES FOR CODE CHANGES:
+- ALWAYS read the code first with READ_CODE before making changes
+- NEVER paste code in Discord. No code blocks. Just describe what you changed in 2-3 sentences.
+- NEVER change env var names, GITHUB_REPO, MONDAY_BOARD_ID, or CLAUDE_MODEL
 - NEVER remove existing features when adding new ones
-- NEVER change the Claude model from claude-opus-4-6
-- NEVER add new pip dependencies without also updating requirements.txt
-- If you can't read the current code for any reason, tell the user and DO NOT guess
-
-WORKFLOW FOR LEARNING NEW SKILLS (code changes):
-1. User tells you something doesn't work or asks for a new feature
-2. You output READ_CODE:{"file": "bot.py"} to see your current code
-3. The bot fetches the code from GitHub and feeds it back to you
-4. You identify exactly what needs to change
-5. You make ONLY the targeted changes, keeping everything else identical
-6. In your response, show ONLY the parts you changed (a short diff/summary), NOT the entire file — the full file is too large for Discord
-7. Put the COMPLETE updated file content in the PUSH_CODE command (Discord won't display this, it goes straight to GitHub)
-8. User says "push it" → code gets pushed to GitHub → Railway auto-deploys
-9. You confirm: "I just learned [skill]. Now I can [capability]."
-
-IMPORTANT: The PUSH_CODE content is NOT shown in Discord — it goes directly to GitHub. So you CAN include the full file there even though it's large. Only your chat message has the Discord character limit.
+- Keep patches small and targeted — only change what's needed
 
 SENDING MESSAGES TO OTHER CHANNELS:
 When a user asks you to send a message to another channel or @mention someone:
@@ -133,7 +127,7 @@ SEND_MESSAGE:{"channel": "<channel-name>", "message": "<the message to send>"}
 - Always confirm to the user that you'll send the message.
 
 RULES:
-- Only output ONE command per message (SAVE_IDEA, SAVE_LEARNING, PUSH_CODE, SEND_MESSAGE, or READ_CODE — never combine them)
+- Only output ONE command per message (SAVE_IDEA, SAVE_LEARNING, PUSH_CODE, SEND_MESSAGE, READ_CODE, or GENERATE_IMAGE — never combine them)
 - Place the command at the END, after your conversational response
 - For Discord, keep chat responses reasonably concise but don't sacrifice quality
 - For code and technical answers, be as thorough as needed
@@ -230,6 +224,54 @@ def extract_url_context(text):
         return ""
 
     return "\n\n".join(context_parts)
+
+
+# ============================================================
+# IMAGE GENERATION — fal.ai
+# ============================================================
+
+def generate_image_fal(prompt):
+    """Generate an image using fal.ai API and return the image URL."""
+    if not FAL_KEY:
+        return None, "No FAL_KEY configured."
+
+    try:
+        import fal_client
+
+        os.environ["FAL_KEY"] = FAL_KEY
+
+        result = fal_client.subscribe(
+            "fal-ai/nano-banana-pro",
+            arguments={
+                "prompt": prompt,
+                "image_size": {"width": 3840, "height": 2160},
+                "num_images": 1,
+                "enable_safety_checker": False,
+            },
+        )
+
+        if result and "images" in result and len(result["images"]) > 0:
+            return result["images"][0]["url"], None
+        else:
+            return None, "No image returned from fal.ai"
+
+    except Exception as e:
+        print(f"fal.ai error: {e}")
+        return None, str(e)
+
+
+def parse_generate_image_command(response_text):
+    """Check if Claude's response contains a GENERATE_IMAGE command."""
+    match = re.search(r'GENERATE_IMAGE:(\{.*\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+
+    try:
+        image_data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, image_data
+    except json.JSONDecodeError:
+        return response_text, None
 
 
 # ============================================================
@@ -725,7 +767,7 @@ def parse_learning_command(response_text):
 
 
 def parse_push_command(response_text):
-    """Check if Claude's response contains a PUSH_CODE command."""
+    """Check if Claude's response contains a PUSH_CODE command (legacy, should not be used)."""
     match = re.search(r'PUSH_CODE:(\{.*\})', response_text, re.DOTALL)
     if not match:
         return response_text, None
@@ -736,6 +778,34 @@ def parse_push_command(response_text):
         return clean_text, push_data
     except json.JSONDecodeError:
         return response_text, None
+
+
+def parse_patch_command(response_text):
+    """Check if Claude's response contains a PATCH_CODE command."""
+    match = re.search(r'PATCH_CODE:(\{.*\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+
+    try:
+        patch_data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, patch_data
+    except json.JSONDecodeError:
+        return response_text, None
+
+
+def apply_patches(original_code, patches):
+    """Apply find-and-replace patches to code. Returns (patched_code, errors)."""
+    code = original_code
+    errors = []
+    for i, patch in enumerate(patches):
+        find_text = patch.get("find", "")
+        replace_text = patch.get("replace", "")
+        if find_text and find_text in code:
+            code = code.replace(find_text, replace_text, 1)
+        elif find_text:
+            errors.append(f"Patch {i+1}: couldn't find the text to replace")
+    return code, errors
 
 
 def parse_send_message_command(response_text):
@@ -887,6 +957,10 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
+    # Ignore all bots (prevents bot-to-bot reply loops)
+    if message.author.bot:
+        return
+
     if bot.user not in message.mentions:
         await bot.process_commands(message)
         return
@@ -904,15 +978,33 @@ async def on_message(message):
             del pending_pushes[channel_key]
             async with message.channel.typing():
                 file_name = push_data.get("file", "bot.py")
-                content = push_data.get("content", "")
                 commit_msg = push_data.get("commit_message", "Update from Srele")
 
-                success, result_msg = github_push_file(file_name, content, commit_msg)
+                # PATCH_CODE: apply find/replace patches to current file
+                if "patches" in push_data:
+                    current_code = github_read_file(file_name)
+                    if not current_code:
+                        await message.reply(f"Couldn't read `{file_name}` from GitHub.")
+                        return
+
+                    patched_code, patch_errors = apply_patches(current_code, push_data["patches"])
+
+                    if patch_errors:
+                        await message.reply(f"Some patches failed: {', '.join(patch_errors)}")
+                        return
+
+                    success, result_msg = github_push_file(file_name, patched_code, commit_msg)
+                # Legacy PUSH_CODE: full file content
+                elif "content" in push_data:
+                    success, result_msg = github_push_file(file_name, push_data["content"], commit_msg)
+                else:
+                    await message.reply("No changes to push.")
+                    return
+
                 if success:
                     await message.reply(f"Pushed `{file_name}` to GitHub. Railway will auto-deploy in ~30 seconds.")
                     await message.add_reaction("\U0001f680")  # rocket
 
-                    # Wait and check deploy status
                     await asyncio.sleep(35)
                     status = railway_get_deploy_status()
                     await message.channel.send(f"**Deploy status:**\n{status}")
@@ -1040,20 +1132,19 @@ async def on_message(message):
 
                 code_content = github_read_file(file_to_read)
                 if code_content:
-                    # Feed the code back to Claude so it can make informed changes
                     await message.channel.send(f"Reading `{file_to_read}` from GitHub...")
                     followup = chat_with_claude(
                         str(message.channel.id),
                         "SYSTEM",
-                        f"Here is the current content of {file_to_read}:\n\n```python\n{code_content}\n```\n\nNow make the targeted changes the user requested. Remember: keep everything else identical, only change what's needed.",
+                        f"Here is the current content of {file_to_read}:\n\n```python\n{code_content}\n```\n\nNow make the targeted changes the user requested. Use PATCH_CODE with find/replace patches. Do NOT paste any code in your response — just describe what you changed and output the PATCH_CODE command.",
                     )
 
-                    # Process the followup response for PUSH_CODE
-                    followup_text, push_data = parse_push_command(followup)
-                    if push_data:
-                        pending_pushes[str(message.channel.id)] = push_data
-                        file_name = push_data.get("file", "bot.py")
-                        commit_msg = push_data.get("commit_message", "Update")
+                    # Check for PATCH_CODE first (preferred)
+                    followup_text, patch_data = parse_patch_command(followup)
+                    if patch_data:
+                        pending_pushes[str(message.channel.id)] = patch_data
+                        file_name = patch_data.get("file", "bot.py")
+                        commit_msg = patch_data.get("commit_message", "Update")
 
                         if followup_text:
                             if len(followup_text) <= 2000:
@@ -1064,22 +1155,89 @@ async def on_message(message):
                                     await message.channel.send(chunk)
 
                         await message.channel.send(
-                            f"**Ready to push `{file_name}`** — \"{commit_msg}\"\n\n"
+                            f"**Ready to patch `{file_name}`** — \"{commit_msg}\"\n\n"
                             f"Say **\"push it\"** to deploy or **\"cancel\"** to abort."
                         )
                     else:
-                        if len(followup_text) <= 2000:
-                            await message.channel.send(followup_text)
+                        # Fallback: check for legacy PUSH_CODE
+                        followup_text, push_data = parse_push_command(followup_text)
+                        if push_data:
+                            pending_pushes[str(message.channel.id)] = push_data
+                            file_name = push_data.get("file", "bot.py")
+                            commit_msg = push_data.get("commit_message", "Update")
+                            if followup_text:
+                                await message.channel.send(followup_text[:2000])
+                            await message.channel.send(
+                                f"**Ready to push `{file_name}`** — \"{commit_msg}\"\n\nSay **\"push it\"** to deploy or **\"cancel\"** to abort."
+                            )
                         else:
-                            chunks = [followup_text[i:i+2000] for i in range(0, len(followup_text), 2000)]
-                            for chunk in chunks:
-                                await message.channel.send(chunk)
+                            if len(followup_text) <= 2000:
+                                await message.channel.send(followup_text)
+                            else:
+                                chunks = [followup_text[i:i+2000] for i in range(0, len(followup_text), 2000)]
+                                for chunk in chunks:
+                                    await message.channel.send(chunk)
                 else:
                     await message.channel.send(f"Couldn't read `{file_to_read}` from GitHub. Check if GITHUB_TOKEN is set.")
                 return
 
-            # Check for learning command first
-            display_text, learning_data = parse_learning_command(response)
+            # Check for GENERATE_IMAGE command
+            display_text, image_gen_data = parse_generate_image_command(display_text)
+            if image_gen_data:
+                prompt = image_gen_data.get("prompt", "")
+                if prompt:
+                    if display_text:
+                        await message.reply(display_text)
+
+                    generating_msg = await message.channel.send("Generating image... ~15-30 seconds.")
+
+                    loop = asyncio.get_event_loop()
+                    image_url, error = await loop.run_in_executor(None, generate_image_fal, prompt)
+
+                    await generating_msg.delete()
+
+                    if image_url:
+                        try:
+                            img_resp = requests.get(image_url, timeout=30)
+                            img_resp.raise_for_status()
+                            content_type = img_resp.headers.get("Content-Type", "image/png")
+                            ext = "jpg" if "jpeg" in content_type or "jpg" in content_type else "png"
+                            file = discord.File(io.BytesIO(img_resp.content), filename=f"srele_generated.{ext}")
+                            await message.channel.send(file=file)
+                        except Exception:
+                            await message.channel.send(f"Generated: {image_url}")
+                    else:
+                        await message.channel.send(f"Image generation failed: {error}")
+                return
+
+            # Check for PATCH_CODE (direct, without READ_CODE)
+            display_text, patch_data = parse_patch_command(display_text)
+            if patch_data:
+                pending_pushes[str(message.channel.id)] = patch_data
+                file_name = patch_data.get("file", "bot.py")
+                commit_msg = patch_data.get("commit_message", "Update")
+                if display_text:
+                    await message.reply(display_text[:2000])
+                await message.channel.send(
+                    f"**Ready to patch `{file_name}`** — \"{commit_msg}\"\n\nSay **\"push it\"** to deploy or **\"cancel\"** to abort."
+                )
+                return
+
+            # Check for legacy PUSH_CODE
+            display_text, push_data = parse_push_command(display_text)
+            if push_data:
+                pending_pushes[str(message.channel.id)] = push_data
+                file_name = push_data.get("file", "bot.py")
+                commit_msg = push_data.get("commit_message", "Update")
+                if display_text:
+                    await message.reply(display_text[:2000])
+                await message.channel.send(
+                    f"**Ready to push `{file_name}`** — \"{commit_msg}\"\n\nSay **\"push it\"** to deploy or **\"cancel\"** to abort."
+                )
+                return
+
+            # Check for learning command
+            display_text, learning_data = parse_learning_command(display_text)
             if learning_data:
                 learning_text = learning_data.get("learning", "")
                 if learning_text:
@@ -1502,8 +1660,22 @@ async def setup_hook():
 # ============================================================
 
 if __name__ == "__main__":
+    import time
+
     print("\nStarting Srele Bot...")
     print(f"Board: To-Dos (ID: {MONDAY_BOARD_ID})")
     print(f"Group: SRELE IDEAS ({MONDAY_GROUP_ID})")
     print("Connecting to Discord...\n")
-    bot.run(DISCORD_TOKEN)
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            bot.run(DISCORD_TOKEN)
+            break
+        except Exception as e:
+            wait_time = min(60 * (attempt + 1), 300)  # 60s, 120s, 180s, 240s, 300s
+            print(f"Connection failed (attempt {attempt + 1}/{max_retries}): {e}")
+            print(f"Waiting {wait_time}s before retry...")
+            time.sleep(wait_time)
+
+    print("Bot stopped.")
