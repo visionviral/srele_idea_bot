@@ -261,12 +261,10 @@ def generate_image_fal(prompt):
         os.environ["FAL_KEY"] = FAL_KEY
 
         result = fal_client.subscribe(
-            "fal-ai/flux/dev",
+            "fal-ai/nano-banana-pro",
             arguments={
                 "prompt": prompt,
                 "image_size": {"width": 3840, "height": 2160},
-                "num_inference_steps": 28,
-                "guidance_scale": 3.5,
                 "num_images": 1,
                 "enable_safety_checker": False,
             },
