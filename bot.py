@@ -81,6 +81,11 @@ When someone asks you to generate, create, or make an image:
 - Always write detailed, descriptive prompts for best results
 - When asked to generate an image of "Srele" or "yourself", ALWAYS include this reference: A muscular, tanned, bald/short-haired man in his 40s-50s with a thick strong build, wearing dark aviator sunglasses and a thick silver Byzantine chain necklace with a silver cross pendant, confident charismatic expression, very tanned skin, Balkan tough guy / boss figure.
 - Always generate in 4K quality (high resolution)
+- For IMAGE-TO-IMAGE (when user provides a reference photo): include "image_url" and "strength" in the GENERATE_IMAGE JSON.
+  Example: GENERATE_IMAGE:{"prompt": "description", "image_url": "https://...", "strength": 0.6}
+  - strength 0.3-0.5 = very close to original, 0.5-0.7 = balanced, 0.7-1.0 = more creative freedom
+  - If the user attaches an image, you don't need to include image_url — the bot will auto-detect it
+  - But if you know the URL, include it explicitly for reliability
 
 SAVING IDEAS TO MONDAY.COM:
 Only save when the user EXPLICITLY asks (e.g. "save this", "add to to-do", "track this", "put this as an idea").
@@ -230,8 +235,14 @@ def extract_url_context(text):
 # IMAGE GENERATION — fal.ai
 # ============================================================
 
-def generate_image_fal(prompt):
-    """Generate an image using fal.ai API and return the image URL."""
+def generate_image_fal(prompt, image_url=None, strength=0.65):
+    """Generate an image using fal.ai API. Supports text-to-image and image-to-image.
+    
+    Args:
+        prompt: Text description of desired image
+        image_url: Optional reference image URL for image-to-image mode
+        strength: How much to change the reference image (0.0-1.0, default 0.65)
+    """
     if not FAL_KEY:
         return None, "No FAL_KEY configured."
 
@@ -240,14 +251,22 @@ def generate_image_fal(prompt):
 
         os.environ["FAL_KEY"] = FAL_KEY
 
+        arguments = {
+            "prompt": prompt,
+            "image_size": {"width": 3840, "height": 2160},
+            "num_images": 1,
+            "enable_safety_checker": False,
+        }
+
+        # Image-to-image mode: pass reference image and strength
+        if image_url:
+            arguments["image_url"] = image_url
+            arguments["strength"] = strength
+            print(f"Image-to-image mode: strength={strength}, ref={image_url[:80]}...")
+
         result = fal_client.subscribe(
             "fal-ai/nano-banana-pro",
-            arguments={
-                "prompt": prompt,
-                "image_size": {"width": 3840, "height": 2160},
-                "num_images": 1,
-                "enable_safety_checker": False,
-            },
+            arguments=arguments,
         )
 
         if result and "images" in result and len(result["images"]) > 0:
@@ -1191,8 +1210,19 @@ async def on_message(message):
 
                     generating_msg = await message.channel.send("Generating image... ~15-30 seconds.")
 
+                    # Extract image-to-image parameters
+                    ref_image_url = image_gen_data.get("image_url", None)
+                    img_strength = image_gen_data.get("strength", 0.65)
+
+                    # If no image_url in command but user attached images, use the first one
+                    if not ref_image_url and image_urls:
+                        ref_image_url = image_urls[0]
+                        print(f"Auto-using attached image as reference: {ref_image_url[:80]}...")
+
                     loop = asyncio.get_event_loop()
-                    image_url, error = await loop.run_in_executor(None, generate_image_fal, prompt)
+                    image_url, error = await loop.run_in_executor(
+                        None, generate_image_fal, prompt, ref_image_url, img_strength
+                    )
 
                     await generating_msg.delete()
 
