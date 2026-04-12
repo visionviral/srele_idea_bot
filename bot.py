@@ -258,20 +258,12 @@ def generate_image_fal(prompt, image_url=None, strength=0.65):
             "enable_safety_checker": False,
         }
 
-        # Image-to-image mode: use a different endpoint that supports it
+        # Always use nano-banana-pro — it supports both text-to-image and image-to-image
         model_id = "fal-ai/nano-banana-pro"
         if image_url:
-            # nano-banana-pro doesn't support image-to-image natively
-            # Use flux dev image-to-image instead which properly supports it
-            model_id = "fal-ai/flux/dev/image-to-image"
             arguments["image_url"] = image_url
             arguments["strength"] = strength
-            # Remove image_size for i2i — use the reference image dimensions
-            if "image_size" in arguments:
-                del arguments["image_size"]
-            arguments["num_inference_steps"] = 28
-            arguments["guidance_scale"] = 3.5
-            print(f"Image-to-image mode (flux dev i2i): strength={strength}, ref={image_url[:80]}...")
+            print(f"Image-to-image mode (nano-banana-pro): strength={strength}, ref={image_url[:80]}...")
 
         print(f"Calling fal.ai model: {model_id}")
         print(f"Arguments: { {k: (v[:80] + '...' if isinstance(v, str) and len(v) > 80 else v) for k, v in arguments.items()} }")
