@@ -258,21 +258,35 @@ def generate_image_fal(prompt, image_url=None, strength=0.65):
             "enable_safety_checker": False,
         }
 
-        # Image-to-image mode: pass reference image and strength
+        # Image-to-image mode: use a different endpoint that supports it
+        model_id = "fal-ai/nano-banana-pro"
         if image_url:
+            # nano-banana-pro doesn't support image-to-image natively
+            # Use flux dev image-to-image instead which properly supports it
+            model_id = "fal-ai/flux/dev/image-to-image"
             arguments["image_url"] = image_url
             arguments["strength"] = strength
-            print(f"Image-to-image mode: strength={strength}, ref={image_url[:80]}...")
+            # Remove image_size for i2i — use the reference image dimensions
+            if "image_size" in arguments:
+                del arguments["image_size"]
+            arguments["num_inference_steps"] = 28
+            arguments["guidance_scale"] = 3.5
+            print(f"Image-to-image mode (flux dev i2i): strength={strength}, ref={image_url[:80]}...")
+
+        print(f"Calling fal.ai model: {model_id}")
+        print(f"Arguments: { {k: (v[:80] + '...' if isinstance(v, str) and len(v) > 80 else v) for k, v in arguments.items()} }")
 
         result = fal_client.subscribe(
-            "fal-ai/nano-banana-pro",
+            model_id,
             arguments=arguments,
         )
+
+        print(f"fal.ai result keys: {result.keys() if result else 'None'}")
 
         if result and "images" in result and len(result["images"]) > 0:
             return result["images"][0]["url"], None
         else:
-            return None, "No image returned from fal.ai"
+            return None, f"No image returned from fal.ai. Result: {str(result)[:200]}"
 
     except Exception as e:
         print(f"fal.ai error: {e}")
