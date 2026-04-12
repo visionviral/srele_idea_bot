@@ -15,6 +15,7 @@ Srele is a full-power AI assistant powered by Claude Opus.
 import os
 import asyncio
 import datetime
+import io
 import json
 import re
 import discord
@@ -35,6 +36,7 @@ MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 RAILWAY_API_TOKEN = os.getenv("RAILWAY_API_TOKEN")
+FAL_KEY = os.getenv("FAL_KEY")
 
 GITHUB_REPO = "visionviral/srele_idea_bot"
 GITHUB_BRANCH = "main"
@@ -71,6 +73,14 @@ YOUR CAPABILITIES:
 8. Summarize conversations — give recaps of channel discussions
 9. Send messages to other channels — you can post in any channel on the server
 10. Mention users — you can @mention anyone by name
+11. Generate images — create AI images using fal.ai
+
+IMAGE GENERATION:
+When someone asks you to generate, create, or make an image:
+- Output at the END of your message: GENERATE_IMAGE:{"prompt": "<detailed image prompt>"}
+- Always write detailed, descriptive prompts for best results
+- When asked to generate an image of "Srele" or "yourself", ALWAYS include this reference: A muscular, tanned, bald/short-haired man in his 40s-50s with a thick strong build, wearing dark aviator sunglasses and a thick silver Byzantine chain necklace with a silver cross pendant, confident charismatic expression, very tanned skin, Balkan tough guy / boss figure.
+- Always generate in 4K quality (high resolution)
 
 SAVING IDEAS TO MONDAY.COM:
 Only save when the user EXPLICITLY asks (e.g. "save this", "add to to-do", "track this", "put this as an idea").
@@ -137,7 +147,7 @@ SEND_MESSAGE:{"channel": "<channel-name>", "message": "<the message to send>"}
 - Always confirm to the user that you'll send the message.
 
 RULES:
-- Only output ONE command per message (SAVE_IDEA, SAVE_LEARNING, PUSH_CODE, SEND_MESSAGE, or READ_CODE — never combine them)
+- Only output ONE command per message (SAVE_IDEA, SAVE_LEARNING, PUSH_CODE, SEND_MESSAGE, READ_CODE, or GENERATE_IMAGE — never combine them)
 - Place the command at the END, after your conversational response
 - For Discord, keep chat responses reasonably concise but don't sacrifice quality
 - For code and technical answers, be as thorough as needed
@@ -234,6 +244,56 @@ def extract_url_context(text):
         return ""
 
     return "\n\n".join(context_parts)
+
+
+# ============================================================
+# IMAGE GENERATION — fal.ai
+# ============================================================
+
+def generate_image_fal(prompt):
+    """Generate an image using fal.ai API and return the image URL."""
+    if not FAL_KEY:
+        return None, "No FAL_KEY configured."
+
+    try:
+        import fal_client
+
+        os.environ["FAL_KEY"] = FAL_KEY
+
+        result = fal_client.subscribe(
+            "fal-ai/flux/dev",
+            arguments={
+                "prompt": prompt,
+                "image_size": {"width": 3840, "height": 2160},
+                "num_inference_steps": 28,
+                "guidance_scale": 3.5,
+                "num_images": 1,
+                "enable_safety_checker": False,
+            },
+        )
+
+        if result and "images" in result and len(result["images"]) > 0:
+            return result["images"][0]["url"], None
+        else:
+            return None, "No image returned from fal.ai"
+
+    except Exception as e:
+        print(f"fal.ai error: {e}")
+        return None, str(e)
+
+
+def parse_generate_image_command(response_text):
+    """Check if Claude's response contains a GENERATE_IMAGE command."""
+    match = re.search(r'GENERATE_IMAGE:(\{.*\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+
+    try:
+        image_data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, image_data
+    except json.JSONDecodeError:
+        return response_text, None
 
 
 # ============================================================
@@ -1082,8 +1142,37 @@ async def on_message(message):
                     await message.channel.send(f"Couldn't read `{file_to_read}` from GitHub. Check if GITHUB_TOKEN is set.")
                 return
 
-            # Check for learning command first
-            display_text, learning_data = parse_learning_command(response)
+            # Check for GENERATE_IMAGE command
+            display_text, image_gen_data = parse_generate_image_command(display_text)
+            if image_gen_data:
+                prompt = image_gen_data.get("prompt", "")
+                if prompt:
+                    if display_text:
+                        await message.reply(display_text)
+
+                    generating_msg = await message.channel.send("Generating image... ~15-30 seconds.")
+
+                    loop = asyncio.get_event_loop()
+                    image_url, error = await loop.run_in_executor(None, generate_image_fal, prompt)
+
+                    await generating_msg.delete()
+
+                    if image_url:
+                        try:
+                            img_resp = requests.get(image_url, timeout=30)
+                            img_resp.raise_for_status()
+                            content_type = img_resp.headers.get("Content-Type", "image/png")
+                            ext = "jpg" if "jpeg" in content_type or "jpg" in content_type else "png"
+                            file = discord.File(io.BytesIO(img_resp.content), filename=f"srele_generated.{ext}")
+                            await message.channel.send(file=file)
+                        except Exception:
+                            await message.channel.send(f"Generated: {image_url}")
+                    else:
+                        await message.channel.send(f"Image generation failed: {error}")
+                return
+
+            # Check for learning command
+            display_text, learning_data = parse_learning_command(display_text)
             if learning_data:
                 learning_text = learning_data.get("learning", "")
                 if learning_text:
