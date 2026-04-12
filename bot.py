@@ -95,45 +95,25 @@ SAVE_LEARNING:{"learning": "<what you learned, written as a clear instruction>"}
 
 MODIFYING YOUR OWN CODE:
 When users ask you to add features, fix bugs, or change your behavior by modifying code:
-- Write the complete updated code
-- Show it in a code block so they can review it
-- Ask them to confirm with "push it" or "deploy it"
-- When they confirm, output at the END of your message:
-PUSH_CODE:{"file": "<filename>", "content": "<the full file content>", "commit_message": "<short description of change>"}
-- You can modify: bot.py, requirements.txt, learnings.json, or create new files
-- NEVER push code without showing it first and getting confirmation
-- IMPORTANT: When modifying bot.py, include the COMPLETE file content, not just the changed parts
+1. First read the current code: output READ_CODE:{"file": "bot.py"}
+2. After reading, use PATCH_CODE to make targeted find-and-replace changes
+3. NEVER output the full file. ONLY output the specific parts that change.
 
-CRITICAL SAFETY RULES FOR CODE CHANGES:
-- BEFORE making ANY code change, you MUST first read the current file. Output:
-  READ_CODE:{"file": "bot.py"}
-  The bot will fetch the file from GitHub and show it to you. WAIT for the code to come back before writing changes.
-- NEVER rewrite bot.py from scratch or from memory. You MUST keep the existing code structure.
-- ONLY add, remove, or change the specific parts needed for the requested feature.
-- NEVER change environment variable names. The correct names are:
-  DISCORD_BOT_TOKEN, MONDAY_API_TOKEN, ANTHROPIC_API_KEY, GITHUB_TOKEN
-- NEVER change the GITHUB_REPO value (visionviral/srele_idea_bot) or MONDAY_BOARD_ID (5089081467)
+Output format:
+PATCH_CODE:{"file": "bot.py", "patches": [{"find": "exact text to find", "replace": "new text to replace it with"}], "commit_message": "short description"}
+
+- Each patch is a find-and-replace. "find" must EXACTLY match text in the current file.
+- You can include multiple patches in one command.
+- To ADD new code, find the line BEFORE where you want to insert, and replace it with itself + your new code.
+- To DELETE code, find the code and replace with empty string.
+- NEVER output PUSH_CODE — it is disabled. Only use PATCH_CODE.
+
+CRITICAL RULES FOR CODE CHANGES:
+- ALWAYS read the code first with READ_CODE before making changes
+- NEVER paste code in Discord. No code blocks. Just describe what you changed in 2-3 sentences.
+- NEVER change env var names, GITHUB_REPO, MONDAY_BOARD_ID, or CLAUDE_MODEL
 - NEVER remove existing features when adding new ones
-- NEVER change the Claude model from claude-opus-4-6
-- NEVER add new pip dependencies without also updating requirements.txt
-- If you can't read the current code for any reason, tell the user and DO NOT guess
-
-WORKFLOW FOR LEARNING NEW SKILLS (code changes):
-1. User tells you something doesn't work or asks for a new feature
-2. You output READ_CODE:{"file": "bot.py"} to see your current code
-3. The bot fetches the code from GitHub and feeds it back to you
-4. You identify exactly what needs to change
-5. You make ONLY the targeted changes, keeping everything else identical
-6. In your Discord message, write a SHORT summary (2-3 sentences max) of what you changed. DO NOT show any code blocks in Discord — the user doesn't need to see the code.
-7. Put the COMPLETE updated file content in the PUSH_CODE command — this goes directly to GitHub, NOT to Discord
-8. User says "push it" → code gets pushed to GitHub → Railway auto-deploys
-9. You confirm: "I just learned [skill]. Now I can [capability]."
-
-CRITICAL — DO NOT PASTE CODE IN DISCORD:
-- NEVER include code blocks in your Discord messages when doing code changes
-- The code goes ONLY inside the PUSH_CODE command which is sent directly to GitHub
-- Your Discord message should just say what you changed in plain English, e.g. "I added a /roast command that picks a random roast for the tagged user. Say 'push it' to deploy."
-- This prevents the response from getting too long and cutting off the PUSH_CODE command
+- Keep patches small and targeted — only change what's needed
 
 SENDING MESSAGES TO OTHER CHANNELS:
 When a user asks you to send a message to another channel or @mention someone:
@@ -787,7 +767,7 @@ def parse_learning_command(response_text):
 
 
 def parse_push_command(response_text):
-    """Check if Claude's response contains a PUSH_CODE command."""
+    """Check if Claude's response contains a PUSH_CODE command (legacy, should not be used)."""
     match = re.search(r'PUSH_CODE:(\{.*\})', response_text, re.DOTALL)
     if not match:
         return response_text, None
@@ -798,6 +778,34 @@ def parse_push_command(response_text):
         return clean_text, push_data
     except json.JSONDecodeError:
         return response_text, None
+
+
+def parse_patch_command(response_text):
+    """Check if Claude's response contains a PATCH_CODE command."""
+    match = re.search(r'PATCH_CODE:(\{.*\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+
+    try:
+        patch_data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, patch_data
+    except json.JSONDecodeError:
+        return response_text, None
+
+
+def apply_patches(original_code, patches):
+    """Apply find-and-replace patches to code. Returns (patched_code, errors)."""
+    code = original_code
+    errors = []
+    for i, patch in enumerate(patches):
+        find_text = patch.get("find", "")
+        replace_text = patch.get("replace", "")
+        if find_text and find_text in code:
+            code = code.replace(find_text, replace_text, 1)
+        elif find_text:
+            errors.append(f"Patch {i+1}: couldn't find the text to replace")
+    return code, errors
 
 
 def parse_send_message_command(response_text):
@@ -970,15 +978,33 @@ async def on_message(message):
             del pending_pushes[channel_key]
             async with message.channel.typing():
                 file_name = push_data.get("file", "bot.py")
-                content = push_data.get("content", "")
                 commit_msg = push_data.get("commit_message", "Update from Srele")
 
-                success, result_msg = github_push_file(file_name, content, commit_msg)
+                # PATCH_CODE: apply find/replace patches to current file
+                if "patches" in push_data:
+                    current_code = github_read_file(file_name)
+                    if not current_code:
+                        await message.reply(f"Couldn't read `{file_name}` from GitHub.")
+                        return
+
+                    patched_code, patch_errors = apply_patches(current_code, push_data["patches"])
+
+                    if patch_errors:
+                        await message.reply(f"Some patches failed: {', '.join(patch_errors)}")
+                        return
+
+                    success, result_msg = github_push_file(file_name, patched_code, commit_msg)
+                # Legacy PUSH_CODE: full file content
+                elif "content" in push_data:
+                    success, result_msg = github_push_file(file_name, push_data["content"], commit_msg)
+                else:
+                    await message.reply("No changes to push.")
+                    return
+
                 if success:
                     await message.reply(f"Pushed `{file_name}` to GitHub. Railway will auto-deploy in ~30 seconds.")
                     await message.add_reaction("\U0001f680")  # rocket
 
-                    # Wait and check deploy status
                     await asyncio.sleep(35)
                     status = railway_get_deploy_status()
                     await message.channel.send(f"**Deploy status:**\n{status}")
@@ -1106,20 +1132,19 @@ async def on_message(message):
 
                 code_content = github_read_file(file_to_read)
                 if code_content:
-                    # Feed the code back to Claude so it can make informed changes
                     await message.channel.send(f"Reading `{file_to_read}` from GitHub...")
                     followup = chat_with_claude(
                         str(message.channel.id),
                         "SYSTEM",
-                        f"Here is the current content of {file_to_read}:\n\n```python\n{code_content}\n```\n\nNow make the targeted changes the user requested. Remember: keep everything else identical, only change what's needed.",
+                        f"Here is the current content of {file_to_read}:\n\n```python\n{code_content}\n```\n\nNow make the targeted changes the user requested. Use PATCH_CODE with find/replace patches. Do NOT paste any code in your response — just describe what you changed and output the PATCH_CODE command.",
                     )
 
-                    # Process the followup response for PUSH_CODE
-                    followup_text, push_data = parse_push_command(followup)
-                    if push_data:
-                        pending_pushes[str(message.channel.id)] = push_data
-                        file_name = push_data.get("file", "bot.py")
-                        commit_msg = push_data.get("commit_message", "Update")
+                    # Check for PATCH_CODE first (preferred)
+                    followup_text, patch_data = parse_patch_command(followup)
+                    if patch_data:
+                        pending_pushes[str(message.channel.id)] = patch_data
+                        file_name = patch_data.get("file", "bot.py")
+                        commit_msg = patch_data.get("commit_message", "Update")
 
                         if followup_text:
                             if len(followup_text) <= 2000:
@@ -1130,16 +1155,28 @@ async def on_message(message):
                                     await message.channel.send(chunk)
 
                         await message.channel.send(
-                            f"**Ready to push `{file_name}`** — \"{commit_msg}\"\n\n"
+                            f"**Ready to patch `{file_name}`** — \"{commit_msg}\"\n\n"
                             f"Say **\"push it\"** to deploy or **\"cancel\"** to abort."
                         )
                     else:
-                        if len(followup_text) <= 2000:
-                            await message.channel.send(followup_text)
+                        # Fallback: check for legacy PUSH_CODE
+                        followup_text, push_data = parse_push_command(followup_text)
+                        if push_data:
+                            pending_pushes[str(message.channel.id)] = push_data
+                            file_name = push_data.get("file", "bot.py")
+                            commit_msg = push_data.get("commit_message", "Update")
+                            if followup_text:
+                                await message.channel.send(followup_text[:2000])
+                            await message.channel.send(
+                                f"**Ready to push `{file_name}`** — \"{commit_msg}\"\n\nSay **\"push it\"** to deploy or **\"cancel\"** to abort."
+                            )
                         else:
-                            chunks = [followup_text[i:i+2000] for i in range(0, len(followup_text), 2000)]
-                            for chunk in chunks:
-                                await message.channel.send(chunk)
+                            if len(followup_text) <= 2000:
+                                await message.channel.send(followup_text)
+                            else:
+                                chunks = [followup_text[i:i+2000] for i in range(0, len(followup_text), 2000)]
+                                for chunk in chunks:
+                                    await message.channel.send(chunk)
                 else:
                     await message.channel.send(f"Couldn't read `{file_to_read}` from GitHub. Check if GITHUB_TOKEN is set.")
                 return
@@ -1171,6 +1208,32 @@ async def on_message(message):
                             await message.channel.send(f"Generated: {image_url}")
                     else:
                         await message.channel.send(f"Image generation failed: {error}")
+                return
+
+            # Check for PATCH_CODE (direct, without READ_CODE)
+            display_text, patch_data = parse_patch_command(display_text)
+            if patch_data:
+                pending_pushes[str(message.channel.id)] = patch_data
+                file_name = patch_data.get("file", "bot.py")
+                commit_msg = patch_data.get("commit_message", "Update")
+                if display_text:
+                    await message.reply(display_text[:2000])
+                await message.channel.send(
+                    f"**Ready to patch `{file_name}`** — \"{commit_msg}\"\n\nSay **\"push it\"** to deploy or **\"cancel\"** to abort."
+                )
+                return
+
+            # Check for legacy PUSH_CODE
+            display_text, push_data = parse_push_command(display_text)
+            if push_data:
+                pending_pushes[str(message.channel.id)] = push_data
+                file_name = push_data.get("file", "bot.py")
+                commit_msg = push_data.get("commit_message", "Update")
+                if display_text:
+                    await message.reply(display_text[:2000])
+                await message.channel.send(
+                    f"**Ready to push `{file_name}`** — \"{commit_msg}\"\n\nSay **\"push it\"** to deploy or **\"cancel\"** to abort."
+                )
                 return
 
             # Check for learning command
