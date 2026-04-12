@@ -34,6 +34,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+RAILWAY_API_TOKEN = os.getenv("RAILWAY_API_TOKEN")
 
 GITHUB_REPO = "visionviral/srele_idea_bot"
 GITHUB_BRANCH = "main"
@@ -404,6 +405,112 @@ def github_read_file(file_path):
         content_b64 = resp.json().get("content", "")
         return base64.b64decode(content_b64).decode("utf-8")
     return None
+
+
+# ============================================================
+# RAILWAY API — deploy status & logs
+# ============================================================
+
+RAILWAY_API_URL = "https://backboard.railway.com/graphql/v2"
+
+
+def railway_request(query, variables=None):
+    """Send a GraphQL request to Railway API."""
+    if not RAILWAY_API_TOKEN:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {RAILWAY_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {"query": query}
+    if variables:
+        payload["variables"] = variables
+
+    resp = requests.post(RAILWAY_API_URL, json=payload, headers=headers)
+    if resp.status_code == 200:
+        return resp.json()
+    print(f"Railway API error: {resp.status_code} {resp.text[:200]}")
+    return None
+
+
+def railway_get_deploy_status():
+    """Get the latest deployment status."""
+    query = """
+    query {
+        deployments(first: 3, input: {projectId: "%s"}) {
+            edges {
+                node {
+                    id
+                    status
+                    createdAt
+                    meta {
+                        commitMessage
+                    }
+                }
+            }
+        }
+    }
+    """
+    # We need the project ID — get it from the project list
+    project_query = """
+    query {
+        projects(first: 5) {
+            edges {
+                node {
+                    id
+                    name
+                }
+            }
+        }
+    }
+    """
+    result = railway_request(project_query)
+    if not result:
+        return "Couldn't connect to Railway API."
+
+    projects = result.get("data", {}).get("projects", {}).get("edges", [])
+    project_id = None
+    for p in projects:
+        if "srele" in p["node"]["name"].lower():
+            project_id = p["node"]["id"]
+            break
+
+    if not project_id and projects:
+        project_id = projects[0]["node"]["id"]
+
+    if not project_id:
+        return "Couldn't find project on Railway."
+
+    deploy_query = """
+    query ($projectId: String!) {
+        deployments(first: 3, input: {projectId: $projectId}) {
+            edges {
+                node {
+                    id
+                    status
+                    createdAt
+                }
+            }
+        }
+    }
+    """
+    result = railway_request(deploy_query, {"projectId": project_id})
+    if not result:
+        return "Couldn't fetch deployments."
+
+    deploys = result.get("data", {}).get("deployments", {}).get("edges", [])
+    if not deploys:
+        return "No deployments found."
+
+    lines = []
+    for d in deploys:
+        node = d["node"]
+        status = node.get("status", "unknown")
+        created = node.get("createdAt", "")[:19]
+        lines.append(f"- **{status}** ({created})")
+
+    return "Recent deploys:\n" + "\n".join(lines)
 
 
 # ============================================================
@@ -804,6 +911,11 @@ async def on_message(message):
                 if success:
                     await message.reply(f"Pushed `{file_name}` to GitHub. Railway will auto-deploy in ~30 seconds.")
                     await message.add_reaction("\U0001f680")  # rocket
+
+                    # Wait and check deploy status
+                    await asyncio.sleep(35)
+                    status = railway_get_deploy_status()
+                    await message.channel.send(f"**Deploy status:**\n{status}")
                 else:
                     await message.reply(f"Push failed: {result_msg}")
             return
@@ -1285,6 +1397,22 @@ async def slash_errors(interaction: discord.Interaction):
         )
     embed.set_footer(text=f"{len(recent_errors)} total errors logged")
     await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="deploy-status", description="Check the latest Railway deployment status")
+async def slash_deploy_status(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        status = railway_get_deploy_status()
+        embed = discord.Embed(
+            title="Railway Deploy Status",
+            description=status,
+            color=0x7B61FF,
+        )
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"Couldn't check deploy status: `{str(e)[:100]}`")
 
 
 @bot.tree.command(name="rollback", description="Restore Srele to the last confirmed working version")
