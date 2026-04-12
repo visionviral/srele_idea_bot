@@ -1506,8 +1506,22 @@ async def setup_hook():
 # ============================================================
 
 if __name__ == "__main__":
+    import time
+
     print("\nStarting Srele Bot...")
     print(f"Board: To-Dos (ID: {MONDAY_BOARD_ID})")
     print(f"Group: SRELE IDEAS ({MONDAY_GROUP_ID})")
     print("Connecting to Discord...\n")
-    bot.run(DISCORD_TOKEN)
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            bot.run(DISCORD_TOKEN)
+            break
+        except Exception as e:
+            wait_time = min(60 * (attempt + 1), 300)  # 60s, 120s, 180s, 240s, 300s
+            print(f"Connection failed (attempt {attempt + 1}/{max_retries}): {e}")
+            print(f"Waiting {wait_time}s before retry...")
+            time.sleep(wait_time)
+
+    print("Bot stopped.")
