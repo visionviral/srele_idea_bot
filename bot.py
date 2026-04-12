@@ -951,6 +951,10 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
+    # Ignore all bots (prevents bot-to-bot reply loops)
+    if message.author.bot:
+        return
+
     if bot.user not in message.mentions:
         await bot.process_commands(message)
         return
