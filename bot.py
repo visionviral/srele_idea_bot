@@ -888,6 +888,29 @@ def parse_patch_command(response_text):
         return response_text, None
 
 
+def validate_code_before_push(file_name, original_code, new_code):
+    """Sanity-check patched code before pushing. Returns (ok, reason)."""
+    if not new_code or not new_code.strip():
+        return False, "new file is empty"
+
+    orig_len = len(original_code)
+    new_len = len(new_code)
+    if orig_len > 500 and new_len < orig_len * 0.5:
+        return False, (
+            f"new file is suspiciously small ({new_len} bytes vs {orig_len} original) — "
+            f"this looks like a truncated patch"
+        )
+
+    if file_name.endswith(".py"):
+        try:
+            import ast as _ast
+            _ast.parse(new_code)
+        except SyntaxError as e:
+            return False, f"Python syntax error at line {e.lineno}: {e.msg}"
+
+    return True, "ok"
+
+
 def apply_patches(original_code, patches):
     """Apply find-and-replace patches to code. Returns (patched_code, errors)."""
     code = original_code
@@ -1100,10 +1123,19 @@ async def on_message(message):
                         await message.reply(f"Some patches failed: {', '.join(patch_errors)}")
                         return
 
+                    ok, reason = validate_code_before_push(file_name, current_code, patched_code)
+                    if not ok:
+                        await message.reply(f"Refused to push — {reason}. No changes made to GitHub.")
+                        return
+
                     success, result_msg = github_push_file(file_name, patched_code, commit_msg)
-                # Legacy PUSH_CODE: full file content
+                # Legacy PUSH_CODE: full file content — DISABLED to prevent truncated pushes
                 elif "content" in push_data:
-                    success, result_msg = github_push_file(file_name, push_data["content"], commit_msg)
+                    await message.reply(
+                        "PUSH_CODE (full-file) is disabled — it's the one that caused the truncated-file bug. "
+                        "Ask me to re-do the change as a PATCH_CODE (find/replace) and I'll push that safely."
+                    )
+                    return
                 else:
                     await message.reply("No changes to push.")
                     return
