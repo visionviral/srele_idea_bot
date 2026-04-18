@@ -147,6 +147,14 @@ CRITICAL RULES FOR CODE CHANGES:
 - NEVER remove existing features when adding new ones
 - Keep patches small and targeted — only change what's needed
 
+READING CHAT HISTORY (deep scan):
+By default you only see the last 50 messages of the current channel. When the user asks you to look further back, audit past conversations, or read a different channel, output at the END of your message:
+READ_HISTORY:{"channel": "<channel-name or empty for current>", "limit": 300}
+- channel: the channel name without "#". Leave empty/omit to read the current channel.
+- limit: how many messages to fetch (max 500). Default 300.
+- After the history is fetched, you'll be re-invoked with the full history as context and should then produce the actual answer (including any SAVE_IDEA / RELABEL_IDEA commands if the user asked you to act on what you found).
+- Use this when the user says things like "go through our chats", "look back at what I said about X", "audit the channel", "find where I mentioned Y".
+
 SENDING MESSAGES TO OTHER CHANNELS:
 When a user asks you to send a message to another channel or @mention someone:
 - You CAN do this. Output at the END of your message:
@@ -159,7 +167,7 @@ SEND_MESSAGE:{"channel": "<channel-name>", "message": "<the message to send>"}
 - Always confirm to the user that you'll send the message.
 
 RULES:
-- Only output ONE command per message (SAVE_IDEA, RELABEL_IDEA, SAVE_LEARNING, PUSH_CODE, SEND_MESSAGE, READ_CODE, or GENERATE_IMAGE — never combine them)
+- Only output ONE command per message (SAVE_IDEA, RELABEL_IDEA, SAVE_LEARNING, PUSH_CODE, SEND_MESSAGE, READ_CODE, READ_HISTORY, or GENERATE_IMAGE — never combine them)
 - Place the command at the END, after your conversational response
 - For Discord, keep chat responses reasonably concise but don't sacrifice quality
 - For code and technical answers, be as thorough as needed
@@ -894,6 +902,19 @@ def apply_patches(original_code, patches):
     return code, errors
 
 
+def parse_read_history_command(response_text):
+    """Check if Claude's response contains a READ_HISTORY command."""
+    match = re.search(r'READ_HISTORY:(\{.*\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+    try:
+        data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, data
+    except json.JSONDecodeError:
+        return response_text, None
+
+
 def parse_send_message_command(response_text):
     """Check if Claude's response contains a SEND_MESSAGE command."""
     match = re.search(r'SEND_MESSAGE:(\{.*\})', response_text, re.DOTALL)
@@ -1266,6 +1287,56 @@ async def on_message(message):
                 else:
                     await message.channel.send(f"Couldn't read `{file_to_read}` from GitHub. Check if GITHUB_TOKEN is set.")
                 return
+
+            # Check for READ_HISTORY — deep scan of chat history
+            display_text, history_data = parse_read_history_command(display_text)
+            if history_data:
+                req_channel_name = (history_data.get("channel") or "").strip().lstrip("#")
+                req_limit = history_data.get("limit", 300)
+                try:
+                    req_limit = max(1, min(int(req_limit), 500))
+                except (TypeError, ValueError):
+                    req_limit = 300
+
+                if req_channel_name:
+                    target_channel = discord.utils.get(message.guild.text_channels, name=req_channel_name)
+                else:
+                    target_channel = message.channel
+
+                if display_text:
+                    await message.reply(display_text)
+
+                if not target_channel:
+                    await message.channel.send(f"Couldn't find channel **#{req_channel_name}**.")
+                    return
+
+                scanning_msg = await message.channel.send(
+                    f"Scanning last {req_limit} messages of #{target_channel.name}..."
+                )
+                try:
+                    history_msgs = await fetch_channel_history_for_summary(target_channel, limit=req_limit)
+                except Exception as e:
+                    await scanning_msg.delete()
+                    await message.channel.send(f"Couldn't read history: `{str(e)[:80]}`")
+                    return
+
+                await scanning_msg.delete()
+
+                history_blob = "\n".join(history_msgs) if history_msgs else "(no messages found)"
+                followup_prompt = (
+                    f"[HISTORY from #{target_channel.name} — {len(history_msgs)} messages, oldest first]\n\n"
+                    f"{history_blob}\n\n"
+                    f"[END HISTORY]\n\n"
+                    f"Now answer the user's original request using this history. "
+                    f"If the request implies action (saving or relabeling ideas), emit the appropriate command."
+                )
+                response = chat_with_claude(
+                    str(message.channel.id),
+                    "SYSTEM",
+                    followup_prompt,
+                )
+                display_text = response
+                # fall through into the rest of the dispatch chain
 
             # Check for GENERATE_IMAGE command
             display_text, image_gen_data = parse_generate_image_command(display_text)
