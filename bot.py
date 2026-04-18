@@ -54,6 +54,27 @@ COL_WHO = "person"
 PRIORITY_TO_BE_MADE = 2
 PRIORITY_WORKING_ON_IT = 0
 PRIORITY_DONE = 1
+PRIORITY_HIGH_INTENT = 5
+PRIORITY_LOW_INTENT = 7
+
+PRIORITY_LABELS = {
+    PRIORITY_TO_BE_MADE: "To be made",
+    PRIORITY_WORKING_ON_IT: "Working on it",
+    PRIORITY_DONE: "Done",
+    PRIORITY_HIGH_INTENT: "HIGH intent idea",
+    PRIORITY_LOW_INTENT: "LOW intent idea",
+}
+
+PRIORITY_KEYWORDS = {
+    "high_intent": PRIORITY_HIGH_INTENT,
+    "high-intent": PRIORITY_HIGH_INTENT,
+    "high intent": PRIORITY_HIGH_INTENT,
+    "low_intent": PRIORITY_LOW_INTENT,
+    "low-intent": PRIORITY_LOW_INTENT,
+    "low intent": PRIORITY_LOW_INTENT,
+    "high": PRIORITY_WORKING_ON_IT,
+    "normal": PRIORITY_TO_BE_MADE,
+}
 
 # Srele's system prompt — built dynamically with learnings
 SRELE_SYSTEM_BASE = """You are Srele, a powerful AI assistant for the React Biome Discord server. You run on Claude Opus — the most capable AI model available.
@@ -81,17 +102,23 @@ When someone asks you to generate, create, or make an image:
 - Always write detailed, descriptive prompts for best results
 - When asked to generate an image of "Srele" or "yourself", ALWAYS include this reference: A muscular, tanned, bald/short-haired man in his 40s-50s with a thick strong build, wearing dark aviator sunglasses and a thick silver Byzantine chain necklace with a silver cross pendant, confident charismatic expression, very tanned skin, Balkan tough guy / boss figure.
 - Always generate in 4K quality (high resolution)
-- For IMAGE-TO-IMAGE (when user provides a reference photo): include "image_url" and "strength" in the GENERATE_IMAGE JSON.
-  Example: GENERATE_IMAGE:{"prompt": "description", "image_url": "https://...", "strength": 0.6}
-  - strength 0.3-0.5 = very close to original, 0.5-0.7 = balanced, 0.7-1.0 = more creative freedom
-  - If the user attaches an image, you don't need to include image_url — the bot will auto-detect it
-  - But if you know the URL, include it explicitly for reliability
 
 SAVING IDEAS TO MONDAY.COM:
 Only save when the user EXPLICITLY asks (e.g. "save this", "add to to-do", "track this", "put this as an idea").
 When saving, output at the END of your message:
 SAVE_IDEA:{"idea": "<the full idea text>", "priority": "normal"}
-Set priority to "high" only if marked urgent/important/asap/critical.
+Priority values:
+- "high_intent" — user signals strong intent/commitment/excitement about the idea (says things like "this is a high intent idea", "I really want this", "this is important to me")
+- "low_intent" — user signals weak intent/"just throwing it out there"/exploratory/maybe (says "low intent", "just an idea", "maybe someday")
+- "high" — urgent/asap/critical execution priority
+- "normal" — default, no strong signal
+
+RELABELING EXISTING IDEAS:
+When the user asks to re-label, re-categorize, or change the priority of an existing Monday idea (e.g. "mark idea X as high intent", "set that one to low intent"):
+Output at the END of your message:
+RELABEL_IDEA:{"query": "<text to find the item by name, case-insensitive partial match>", "priority": "high_intent"}
+- priority accepts the same values as SAVE_IDEA
+- The bot will search recent items and update the first match.
 
 LEARNING NEW THINGS:
 When users teach you something ("learn this:", "remember that:", "from now on:", "when I say X do Y"):
@@ -132,7 +159,7 @@ SEND_MESSAGE:{"channel": "<channel-name>", "message": "<the message to send>"}
 - Always confirm to the user that you'll send the message.
 
 RULES:
-- Only output ONE command per message (SAVE_IDEA, SAVE_LEARNING, PUSH_CODE, SEND_MESSAGE, READ_CODE, or GENERATE_IMAGE — never combine them)
+- Only output ONE command per message (SAVE_IDEA, RELABEL_IDEA, SAVE_LEARNING, PUSH_CODE, SEND_MESSAGE, READ_CODE, or GENERATE_IMAGE — never combine them)
 - Place the command at the END, after your conversational response
 - For Discord, keep chat responses reasonably concise but don't sacrifice quality
 - For code and technical answers, be as thorough as needed
@@ -235,14 +262,8 @@ def extract_url_context(text):
 # IMAGE GENERATION — fal.ai
 # ============================================================
 
-def generate_image_fal(prompt, image_url=None, strength=0.65):
-    """Generate an image using fal.ai API. Supports text-to-image and image-to-image.
-    
-    Args:
-        prompt: Text description of desired image
-        image_url: Optional reference image URL for image-to-image mode
-        strength: How much to change the reference image (0.0-1.0, default 0.65)
-    """
+def generate_image_fal(prompt):
+    """Generate an image using fal.ai API and return the image URL."""
     if not FAL_KEY:
         return None, "No FAL_KEY configured."
 
@@ -251,34 +272,20 @@ def generate_image_fal(prompt, image_url=None, strength=0.65):
 
         os.environ["FAL_KEY"] = FAL_KEY
 
-        arguments = {
-            "prompt": prompt,
-            "image_size": {"width": 3840, "height": 2160},
-            "num_images": 1,
-            "enable_safety_checker": False,
-        }
-
-        # Always use nano-banana-pro — it supports both text-to-image and image-to-image
-        model_id = "fal-ai/nano-banana-pro"
-        if image_url:
-            arguments["image_url"] = image_url
-            arguments["strength"] = strength
-            print(f"Image-to-image mode (nano-banana-pro): strength={strength}, ref={image_url[:80]}...")
-
-        print(f"Calling fal.ai model: {model_id}")
-        print(f"Arguments: { {k: (v[:80] + '...' if isinstance(v, str) and len(v) > 80 else v) for k, v in arguments.items()} }")
-
         result = fal_client.subscribe(
-            model_id,
-            arguments=arguments,
+            "fal-ai/nano-banana-pro",
+            arguments={
+                "prompt": prompt,
+                "image_size": {"width": 3840, "height": 2160},
+                "num_images": 1,
+                "enable_safety_checker": False,
+            },
         )
-
-        print(f"fal.ai result keys: {result.keys() if result else 'None'}")
 
         if result and "images" in result and len(result["images"]) > 0:
             return result["images"][0]["url"], None
         else:
-            return None, f"No image returned from fal.ai. Result: {str(result)[:200]}"
+            return None, "No image returned from fal.ai"
 
     except Exception as e:
         print(f"fal.ai error: {e}")
@@ -353,6 +360,46 @@ def create_monday_item(item_name, priority_label_id=PRIORITY_TO_BE_MADE, group_i
 
     result = monday_request(query, variables)
     return result["data"]["create_item"]
+
+
+def update_monday_item_priority(item_id, priority_label_id):
+    column_values = json.dumps({COL_PRIORITY: {"index": priority_label_id}})
+    query = """
+    mutation ($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
+        change_multiple_column_values(
+            board_id: $boardId,
+            item_id: $itemId,
+            column_values: $columnValues
+        ) { id name }
+    }
+    """
+    variables = {
+        "boardId": str(MONDAY_BOARD_ID),
+        "itemId": str(item_id),
+        "columnValues": column_values,
+    }
+    result = monday_request(query, variables)
+    return result["data"]["change_multiple_column_values"]
+
+
+def find_monday_item_by_name(query_text, limit=50):
+    query = """
+    query ($boardId: [ID!]!, $limit: Int!) {
+        boards(ids: $boardId) {
+            items_page(limit: $limit) {
+                items { id name }
+            }
+        }
+    }
+    """
+    variables = {"boardId": [str(MONDAY_BOARD_ID)], "limit": limit}
+    result = monday_request(query, variables)
+    items = result["data"]["boards"][0]["items_page"]["items"]
+    q = query_text.lower().strip()
+    for it in items:
+        if q in it["name"].lower():
+            return it
+    return None
 
 
 def add_item_update(item_id, body_text):
@@ -773,6 +820,20 @@ def parse_save_command(response_text):
         idea_data = json.loads(match.group(1))
         clean_text = response_text[:match.start()].rstrip()
         return clean_text, idea_data
+    except json.JSONDecodeError:
+        return response_text, None
+
+
+def parse_relabel_command(response_text):
+    """Check if Claude's response contains a RELABEL_IDEA command."""
+    match = re.search(r'RELABEL_IDEA:(\{.*\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+
+    try:
+        data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, data
     except json.JSONDecodeError:
         return response_text, None
 
@@ -1216,19 +1277,8 @@ async def on_message(message):
 
                     generating_msg = await message.channel.send("Generating image... ~15-30 seconds.")
 
-                    # Extract image-to-image parameters
-                    ref_image_url = image_gen_data.get("image_url", None)
-                    img_strength = image_gen_data.get("strength", 0.65)
-
-                    # If no image_url in command but user attached images, use the first one
-                    if not ref_image_url and image_urls:
-                        ref_image_url = image_urls[0]
-                        print(f"Auto-using attached image as reference: {ref_image_url[:80]}...")
-
                     loop = asyncio.get_event_loop()
-                    image_url, error = await loop.run_in_executor(
-                        None, generate_image_fal, prompt, ref_image_url, img_strength
-                    )
+                    image_url, error = await loop.run_in_executor(None, generate_image_fal, prompt)
 
                     await generating_msg.delete()
 
@@ -1358,13 +1408,40 @@ async def on_message(message):
                     await message.reply(display_text or "I need a channel name and a message to send.")
                 return
 
+            # Check for relabel command first (updates an existing item)
+            display_text, relabel_data = parse_relabel_command(display_text)
+            if relabel_data:
+                q = relabel_data.get("query", "").strip()
+                priority = str(relabel_data.get("priority", "normal")).lower().strip()
+                priority_id = PRIORITY_KEYWORDS.get(priority, PRIORITY_TO_BE_MADE)
+
+                target = find_monday_item_by_name(q) if q else None
+                if display_text:
+                    await message.reply(display_text)
+
+                if not target:
+                    await message.channel.send(f"Couldn't find an item matching **{q}** on the board.")
+                else:
+                    update_monday_item_priority(target["id"], priority_id)
+                    monday_url = f"https://tryreact1s-team.monday.com/boards/{MONDAY_BOARD_ID}/pulses/{target['id']}"
+                    embed = discord.Embed(
+                        title="Idea Relabeled!",
+                        description=f"**{target['name']}**",
+                        color=0x579bfc,
+                        url=monday_url,
+                    )
+                    embed.add_field(name="New priority", value=PRIORITY_LABELS.get(priority_id, priority), inline=True)
+                    await message.channel.send(embed=embed)
+                    await message.add_reaction("\u2705")
+                return
+
             # Check for save idea command
             display_text, idea_data = parse_save_command(display_text)
 
             if idea_data:
                 idea_text = idea_data.get("idea", raw_text)
-                priority = idea_data.get("priority", "normal")
-                priority_id = PRIORITY_WORKING_ON_IT if priority == "high" else PRIORITY_TO_BE_MADE
+                priority = str(idea_data.get("priority", "normal")).lower().strip()
+                priority_id = PRIORITY_KEYWORDS.get(priority, PRIORITY_TO_BE_MADE)
 
                 item_name = generate_item_name(idea_text)
                 item = create_monday_item(item_name, priority_id)
@@ -1385,11 +1462,7 @@ async def on_message(message):
 
                 monday_url = f"https://tryreact1s-team.monday.com/boards/{MONDAY_BOARD_ID}/pulses/{item_id}"
 
-                priority_labels = {
-                    PRIORITY_TO_BE_MADE: "To be made",
-                    PRIORITY_WORKING_ON_IT: "Working on it",
-                    PRIORITY_DONE: "Done",
-                }
+                priority_labels = PRIORITY_LABELS
 
                 if display_text:
                     await message.reply(display_text)
@@ -1467,10 +1540,7 @@ async def slash_idea(interaction: discord.Interaction, text: str):
 
         monday_url = f"https://tryreact1s-team.monday.com/boards/{MONDAY_BOARD_ID}/pulses/{item_id}"
 
-        priority_labels = {
-            PRIORITY_TO_BE_MADE: "To be made",
-            PRIORITY_WORKING_ON_IT: "Working on it",
-        }
+        priority_labels = PRIORITY_LABELS
 
         embed = discord.Embed(
             title="Idea Saved!",
