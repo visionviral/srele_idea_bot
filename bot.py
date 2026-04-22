@@ -45,7 +45,7 @@ MONDAY_BOARD_ID = 5089081467
 MONDAY_GROUP_ID = "group_mm1m2py5"       # SRELE IDEAS group
 MONDAY_API_URL = "https://api.monday.com/v2"
 
-CLAUDE_MODEL = "claude-opus-4-6"
+CLAUDE_MODEL = "claude-opus-4-7"
 
 COL_PRIORITY = "status"
 COL_DATE_ADDED = "datum"
