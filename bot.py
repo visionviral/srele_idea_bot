@@ -160,9 +160,13 @@ When a user asks you to send a message to another channel or @mention someone:
 - You CAN do this. Output at the END of your message:
 SEND_MESSAGE:{"channel": "<channel-name>", "message": "<the message to send>"}
 - The channel name should NOT include the # symbol, just the name (e.g. "general", "ideas", "random")
-- To mention a user in the message, use their display name wrapped in double curly braces: {{username}}
-  Example: "Hey {{Matej}}, are you coming to the office?"
-  The bot will resolve the name to the correct Discord @mention.
+- MENTIONS (work for BOTH SEND_MESSAGE messages AND your normal replies):
+  * Preferred: wrap the display name in double curly braces — {{Matej}}
+    Example: "Hey {{Matej}}, kolko je sati?"
+  * Also works: bare @Name with a valid display name — @Matej
+    Example: "@Matej di si?"
+  The bot resolves {{Name}} and @Name to real Discord pings (<@user_id>) before sending.
+  If the name can't be matched to a real server member, {{Name}} falls back to plain "@Name" (no ping).
 - You can mention multiple users in one message.
 - Always confirm to the user that you'll send the message.
 
@@ -966,39 +970,78 @@ def parse_read_code_command(response_text):
         return response_text, None
 
 
+async def _find_member(guild, name):
+    """Look up a guild member by display name or username (case-insensitive, exact match preferred)."""
+    n = name.lower().strip()
+    if not n:
+        return None
+
+    # Local cache — exact match first
+    member = discord.utils.find(
+        lambda m: m.display_name.lower() == n or m.name.lower() == n,
+        guild.members
+    )
+    if member:
+        return member
+
+    # Local cache — startswith match (handles "Matej" → "Matej K.")
+    member = discord.utils.find(
+        lambda m: m.display_name.lower().startswith(n) or m.name.lower().startswith(n),
+        guild.members
+    )
+    if member:
+        return member
+
+    # Fall back to Discord server-side search
+    try:
+        results = await guild.query_members(query=name, limit=5)
+        for m in results:
+            if m.display_name.lower() == n or m.name.lower() == n:
+                return m
+        if results:
+            return results[0]
+    except Exception as e:
+        print(f"Could not query members for '{name}': {e}")
+
+    return None
+
+
 async def resolve_mentions(guild, message_text):
-    """Replace {{username}} with actual Discord @mentions."""
-    pattern = re.compile(r'\{\{(.+?)\}\}')
-    matches = pattern.findall(message_text)
+    """Replace {{username}} and @username placeholders with real Discord <@user_id> pings.
 
-    for name in matches:
-        member = None
+    Supported syntaxes:
+      - {{Name}}   — explicit template (preferred)
+      - @Name      — bare handle (matched only if Name is 3+ alphanumeric chars AND matches a known member)
+    Does not touch already-resolved <@123> mentions.
+    """
+    if not guild or not message_text:
+        return message_text
 
-        # First try the local cache
-        member = discord.utils.find(
-            lambda m, n=name: m.display_name.lower() == n.lower() or m.name.lower() == n.lower(),
-            guild.members
-        )
+    # 1) {{Name}} — explicit template. Replace whether we find the member or not.
+    brace_pattern = re.compile(r'\{\{([^{}]+?)\}\}')
+    for name in set(brace_pattern.findall(message_text)):
+        member = await _find_member(guild, name)
+        replacement = member.mention if member else f"@{name}"
+        message_text = message_text.replace(f"{{{{{name}}}}}", replacement)
 
-        # If not found in cache, search Discord directly
-        if not member:
-            try:
-                results = await guild.query_members(query=name, limit=5)
-                for m in results:
-                    if m.display_name.lower() == name.lower() or m.name.lower() == name.lower():
-                        member = m
-                        break
-                # If exact match not found, use first result
-                if not member and results:
-                    member = results[0]
-            except Exception as e:
-                print(f"Could not query members for '{name}': {e}")
+    # 2) @Name — bare handle. Only replace when we can match an actual member, so we don't
+    #    mangle casual "@ home" or email-looking strings. Skip if already inside <@...>.
+    at_pattern = re.compile(r'(?<![<\w])@([A-Za-z][A-Za-z0-9._-]{2,31})\b')
 
-        if member:
-            message_text = message_text.replace(f"{{{{{name}}}}}", member.mention)
-        else:
-            message_text = message_text.replace(f"{{{{{name}}}}}", f"@{name}")
+    async def _replace_at(text):
+        # Iterate matches right-to-left so replacements don't shift indices.
+        matches = list(at_pattern.finditer(text))
+        for m in reversed(matches):
+            name = m.group(1)
+            # Skip if this looks like role/everyone/here
+            if name.lower() in {"everyone", "here"}:
+                continue
+            member = await _find_member(guild, name)
+            if member:
+                text = text[: m.start()] + member.mention + text[m.end():]
+        return text
 
+    message_text = await _replace_at(message_text)
     return message_text
 
 
@@ -1261,6 +1304,13 @@ async def on_message(message):
                 image_urls=image_urls if image_urls else None,
                 channel_context=channel_context,
             )
+
+            # Resolve mention placeholders ({{Name}} and bare @Name) to real <@user_id>
+            # before any dispatch, so replies, SEND_MESSAGE, etc. all ping correctly.
+            try:
+                response = await resolve_mentions(message.guild, response)
+            except Exception as e:
+                print(f"resolve_mentions failed: {e}")
 
             # Check for READ_CODE first — Srele wants to see its own code
             display_text, read_data = parse_read_code_command(response)
