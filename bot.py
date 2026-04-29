@@ -15,11 +15,12 @@ Srele is a full-power AI assistant powered by Claude Opus.
 import os
 import asyncio
 import datetime
+import time
 import io
 import json
 import re
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import anthropic
 import requests
 from bs4 import BeautifulSoup
@@ -147,6 +148,24 @@ CRITICAL RULES FOR CODE CHANGES:
 - NEVER remove existing features when adding new ones
 - Keep patches small and targeted — only change what's needed
 
+SETTING REMINDERS (real scheduler, persists across restarts):
+When the user asks you to remind them or someone of something at a future time ("remind me tomorrow", "in 2 hours", "tomorrow at 9am", "next Monday morning"):
+Output at the END of your message:
+SET_REMINDER:{"due_at_iso": "<ISO 8601 with timezone, e.g. 2026-04-29T09:00:00+02:00>", "message": "<the reminder text>", "mentions": ["Antonio"]}
+
+You may use ONE of these time fields (pick whichever is easiest):
+- "due_at_iso": absolute ISO 8601 datetime with timezone offset (preferred for "tomorrow at 9am" style requests).
+- "delay_seconds": integer seconds from now (use this for "in 2 hours" → 7200).
+- "due_at_unix": raw unix timestamp.
+
+Use the CURRENT TIME injected at the bottom of this prompt to compute the value. Default to the user's local timezone (Europe/Zagreb / CEST) when they don't specify one.
+
+"mentions" is a list of display names — when the reminder fires, the bot will resolve them to real Discord pings. Include the user(s) who should be reminded.
+
+The reminder message should be short and direct. The bot will fire it in the SAME channel the user is in right now.
+
+When you set a reminder, briefly confirm in chat (e.g. "Got it — remindam te sutra u 9 ujutro 🫡") and then emit the SET_REMINDER command.
+
 READING CHAT HISTORY (deep scan):
 By default you only see the last 50 messages of the current channel. When the user asks you to look further back, audit past conversations, or read a different channel, output at the END of your message:
 READ_HISTORY:{"channel": "<channel-name or empty for current>", "limit": 300}
@@ -171,7 +190,7 @@ SEND_MESSAGE:{"channel": "<channel-name>", "message": "<the message to send>"}
 - Always confirm to the user that you'll send the message.
 
 RULES:
-- Only output ONE command per message (SAVE_IDEA, RELABEL_IDEA, SAVE_LEARNING, PUSH_CODE, SEND_MESSAGE, READ_CODE, READ_HISTORY, or GENERATE_IMAGE — never combine them)
+- Only output ONE command per message (SAVE_IDEA, RELABEL_IDEA, SAVE_LEARNING, SET_REMINDER, PUSH_CODE, SEND_MESSAGE, READ_CODE, READ_HISTORY, or GENERATE_IMAGE — never combine them)
 - Place the command at the END, after your conversational response
 - For Discord, keep chat responses reasonably concise but don't sacrifice quality
 - For code and technical answers, be as thorough as needed
@@ -188,6 +207,11 @@ CHANNEL_CONTEXT_LIMIT = 50
 
 # Cached learnings (loaded on startup, updated live)
 srele_learnings = []
+
+# Cached reminders (loaded on startup, updated live)
+# Each entry: {id, due_at_unix, channel_id, message, mentions, created_by_name}
+srele_reminders = []
+LOCAL_TZ_NAME = "Europe/Zagreb"  # default user timezone for natural-language times
 
 # Recent error log (so Srele can debug itself)
 recent_errors = []
@@ -692,9 +716,136 @@ def save_learning(learning_text, taught_by=""):
         return False
 
 
+REMINDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminders.json")
+
+
+def load_reminders():
+    """Load reminders from reminders.json."""
+    global srele_reminders
+    try:
+        with open(REMINDERS_FILE, "r") as f:
+            data = json.load(f)
+            srele_reminders = data.get("reminders", [])
+            print(f"Loaded {len(srele_reminders)} reminders from {REMINDERS_FILE}")
+    except FileNotFoundError:
+        srele_reminders = []
+        print("No reminders file yet, starting empty")
+    except Exception as e:
+        srele_reminders = []
+        print(f"Could not load reminders: {e}")
+
+
+def _persist_reminders():
+    try:
+        with open(REMINDERS_FILE, "w") as f:
+            json.dump({"reminders": srele_reminders}, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Could not save reminders: {e}")
+
+
+def add_reminder(due_at_unix, channel_id, msg_text, mentions=None, created_by=""):
+    """Append a new reminder and persist."""
+    global srele_reminders
+    rem = {
+        "id": int(time.time() * 1000),
+        "due_at_unix": int(due_at_unix),
+        "channel_id": str(channel_id),
+        "message": msg_text,
+        "mentions": mentions or [],
+        "created_by": created_by,
+        "created_at_unix": int(time.time()),
+    }
+    srele_reminders.append(rem)
+    _persist_reminders()
+    return rem
+
+
+def pop_due_reminders(now_unix=None):
+    """Return all reminders whose due_at_unix has passed; remove them from storage."""
+    global srele_reminders
+    if now_unix is None:
+        now_unix = int(time.time())
+    due = [r for r in srele_reminders if r.get("due_at_unix", 0) <= now_unix]
+    if due:
+        srele_reminders = [r for r in srele_reminders if r.get("due_at_unix", 0) > now_unix]
+        _persist_reminders()
+    return due
+
+
+def parse_due_at(reminder_data, now_unix=None):
+    """Convert SET_REMINDER payload to a unix timestamp.
+
+    Accepts either:
+      - delay_seconds: int, relative to now
+      - due_at_iso:   ISO 8601 string (with timezone, e.g. '2026-04-29T09:00:00+02:00')
+      - due_at_unix:  raw unix seconds
+    Returns int or None.
+    """
+    if now_unix is None:
+        now_unix = int(time.time())
+
+    if "due_at_unix" in reminder_data:
+        try:
+            return int(reminder_data["due_at_unix"])
+        except (TypeError, ValueError):
+            pass
+
+    if "delay_seconds" in reminder_data:
+        try:
+            return now_unix + max(1, int(reminder_data["delay_seconds"]))
+        except (TypeError, ValueError):
+            pass
+
+    if "due_at_iso" in reminder_data:
+        s = str(reminder_data["due_at_iso"]).strip()
+        try:
+            # Python 3.11+ handles "Z"; replace just in case.
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                # Assume LOCAL_TZ if user didn't specify
+                try:
+                    from zoneinfo import ZoneInfo
+                    dt = dt.replace(tzinfo=ZoneInfo(LOCAL_TZ_NAME))
+                except Exception:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+            return int(dt.timestamp())
+        except Exception as e:
+            print(f"parse_due_at: failed to parse '{s}': {e}")
+
+    return None
+
+
+def format_due_for_user(due_at_unix):
+    """Format a due timestamp as human-readable local + UTC."""
+    try:
+        from zoneinfo import ZoneInfo
+        local = datetime.datetime.fromtimestamp(due_at_unix, tz=ZoneInfo(LOCAL_TZ_NAME))
+        return local.strftime("%a %b %d, %H:%M ") + LOCAL_TZ_NAME
+    except Exception:
+        return datetime.datetime.utcfromtimestamp(due_at_unix).strftime("%a %b %d, %H:%M UTC")
+
+
 def build_system_prompt():
     """Build the full system prompt including any learnings."""
     prompt = SRELE_SYSTEM_BASE
+
+    # Inject current time so Srele can correctly compute reminder due times.
+    now_unix = int(time.time())
+    try:
+        from zoneinfo import ZoneInfo
+        local_now = datetime.datetime.now(ZoneInfo(LOCAL_TZ_NAME))
+        local_str = local_now.strftime("%A %Y-%m-%d %H:%M %Z")
+    except Exception:
+        local_str = datetime.datetime.utcnow().strftime("%A %Y-%m-%d %H:%M UTC")
+    utc_str = datetime.datetime.utcfromtimestamp(now_unix).strftime("%Y-%m-%d %H:%M UTC")
+    prompt += (
+        f"\n\nCURRENT TIME (use this when computing reminder due times):\n"
+        f"- Local ({LOCAL_TZ_NAME}): {local_str}\n"
+        f"- UTC: {utc_str}\n"
+        f"- Unix epoch: {now_unix}\n"
+    )
 
     if srele_learnings:
         prompt += "\n\nIMPORTANT — THINGS YOU HAVE LEARNED (always follow these):\n"
@@ -929,6 +1080,19 @@ def apply_patches(original_code, patches):
     return code, errors
 
 
+def parse_set_reminder_command(response_text):
+    """Check if Claude's response contains a SET_REMINDER command."""
+    match = re.search(r'SET_REMINDER:(\{.*\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+    try:
+        data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, data
+    except json.JSONDecodeError:
+        return response_text, None
+
+
 def parse_read_history_command(response_text):
     """Check if Claude's response contains a READ_HISTORY command."""
     match = re.search(r'READ_HISTORY:(\{.*\})', response_text, re.DOTALL)
@@ -1108,6 +1272,44 @@ intents.members = True
 bot = commands.Bot(command_prefix="!srele ", intents=intents)
 
 
+@tasks.loop(seconds=30)
+async def reminder_loop():
+    """Every 30s: fire any due reminders, ping the listed users in their original channel."""
+    try:
+        due = pop_due_reminders()
+        if not due:
+            return
+        for rem in due:
+            try:
+                channel = bot.get_channel(int(rem["channel_id"]))
+                if channel is None:
+                    try:
+                        channel = await bot.fetch_channel(int(rem["channel_id"]))
+                    except Exception as e:
+                        print(f"reminder_loop: channel {rem['channel_id']} unreachable: {e}")
+                        continue
+
+                ping_text = ""
+                if rem.get("mentions"):
+                    ping_text = " ".join(f"{{{{{n}}}}}" for n in rem["mentions"])
+                    ping_text = await resolve_mentions(channel.guild, ping_text)
+                    ping_text = ping_text.strip()
+
+                body = f"\u23f0 Reminder: {rem['message']}"
+                full = f"{ping_text}\n{body}" if ping_text else body
+                await channel.send(full)
+                print(f"Fired reminder {rem['id']} in #{channel.name}: {rem['message'][:60]}")
+            except Exception as e:
+                print(f"reminder_loop: failed to deliver reminder {rem.get('id')}: {e}")
+    except Exception as e:
+        print(f"reminder_loop crashed: {e}")
+
+
+@reminder_loop.before_loop
+async def _before_reminder_loop():
+    await bot.wait_until_ready()
+
+
 @bot.event
 async def on_ready():
     print(f"\n Srele is online as {bot.user} (ID: {bot.user.id})")
@@ -1116,6 +1318,11 @@ async def on_ready():
 
     # Load learnings from learnings.json on startup
     load_learnings()
+
+    # Load reminders from reminders.json on startup, then start the dispatch loop
+    load_reminders()
+    if not reminder_loop.is_running():
+        reminder_loop.start()
 
     await bot.change_presence(
         activity=discord.Activity(
@@ -1559,6 +1766,49 @@ async def on_message(message):
                         await message.reply(f"Couldn't find channel **#{target_channel_name}**. Check the name?")
                 else:
                     await message.reply(display_text or "I need a channel name and a message to send.")
+                return
+
+            # Check for SET_REMINDER (real scheduled reminder)
+            display_text, reminder_data = parse_set_reminder_command(display_text)
+            if reminder_data:
+                due_unix = parse_due_at(reminder_data)
+                msg_text = (reminder_data.get("message") or "").strip()
+                mentions = reminder_data.get("mentions") or []
+
+                if display_text:
+                    await message.reply(display_text)
+
+                if not due_unix or not msg_text:
+                    await message.channel.send(
+                        "Couldn't set the reminder — missing/invalid time or message."
+                    )
+                    return
+
+                if due_unix <= int(time.time()):
+                    await message.channel.send(
+                        "Couldn't set the reminder — the time you gave me is in the past."
+                    )
+                    return
+
+                rem = add_reminder(
+                    due_at_unix=due_unix,
+                    channel_id=message.channel.id,
+                    msg_text=msg_text,
+                    mentions=mentions,
+                    created_by=message.author.display_name,
+                )
+                human_when = format_due_for_user(due_unix)
+                mention_preview = ", ".join(mentions) if mentions else "—"
+                embed = discord.Embed(
+                    title="Reminder set",
+                    description=msg_text,
+                    color=0x579bfc,
+                )
+                embed.add_field(name="When", value=human_when, inline=False)
+                embed.add_field(name="Will ping", value=mention_preview, inline=True)
+                embed.set_footer(text=f"id {rem['id']} · in #{message.channel.name}")
+                await message.channel.send(embed=embed)
+                await message.add_reaction("\u23f0")  # alarm clock
                 return
 
             # Check for relabel command first (updates an existing item)
