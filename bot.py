@@ -74,7 +74,17 @@ PRIORITY_KEYWORDS = {
     "low-intent": PRIORITY_LOW_INTENT,
     "low intent": PRIORITY_LOW_INTENT,
     "high": PRIORITY_WORKING_ON_IT,
+    "working_on_it": PRIORITY_WORKING_ON_IT,
+    "working on it": PRIORITY_WORKING_ON_IT,
+    "in_progress": PRIORITY_WORKING_ON_IT,
     "normal": PRIORITY_TO_BE_MADE,
+    "to_be_made": PRIORITY_TO_BE_MADE,
+    "to be made": PRIORITY_TO_BE_MADE,
+    "todo": PRIORITY_TO_BE_MADE,
+    "done": PRIORITY_DONE,
+    "completed": PRIORITY_DONE,
+    "complete": PRIORITY_DONE,
+    "finished": PRIORITY_DONE,
 }
 
 # Srele's system prompt — built dynamically with learnings
@@ -114,12 +124,18 @@ Priority values:
 - "high" — urgent/asap/critical execution priority
 - "normal" — default, no strong signal
 
-RELABELING EXISTING IDEAS:
-When the user asks to re-label, re-categorize, or change the priority of an existing Monday idea (e.g. "mark idea X as high intent", "set that one to low intent"):
+RELABELING / MARKING DONE EXISTING IDEAS:
+When the user asks to re-label, re-categorize, mark as done, or change the status of an existing Monday item (e.g. "mark idea X as high intent", "X je done", "mark the DR whitelist task as done", "set that one to low intent"):
 Output at the END of your message:
-RELABEL_IDEA:{"query": "<text to find the item by name, case-insensitive partial match>", "priority": "high_intent"}
-- priority accepts the same values as SAVE_IDEA
-- The bot will search recent items and update the first match.
+RELABEL_IDEA:{"query": "<text to find the item by name, case-insensitive partial match>", "priority": "<priority value>"}
+
+Priority values accepted:
+- "done" / "completed" / "finished" — marks the item as Done ✅ (use this when user says "mark as done", "X je gotov")
+- "high_intent" / "low_intent" — intent labels
+- "high" / "working_on_it" / "in_progress" — actively working on
+- "normal" / "to_be_made" / "todo" — backlog
+
+The bot searches recent items and updates the first name match.
 
 LEARNING NEW THINGS:
 When users teach you something ("learn this:", "remember that:", "from now on:", "when I say X do Y"):
@@ -1066,18 +1082,95 @@ def validate_code_before_push(file_name, original_code, new_code):
     return True, "ok"
 
 
+def _whitespace_normalize(s):
+    """Collapse runs of whitespace and strip per-line — for fuzzy patch matching."""
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def _fuzzy_find_and_replace(code, find_text, replace_text):
+    """Try harder to apply a find/replace.
+
+    Strategy:
+      1. Exact match (fastest, preserves original whitespace).
+      2. Whitespace-normalized match — find a contiguous slice of `code`
+         whose normalized form equals normalized `find_text`. If found,
+         splice in `replace_text` at that location.
+    Returns (new_code, found: bool).
+    """
+    if not find_text:
+        return code, False
+    if find_text in code:
+        return code.replace(find_text, replace_text, 1), True
+
+    target_norm = _whitespace_normalize(find_text)
+    if not target_norm:
+        return code, False
+
+    # Sliding-window over rough byte ranges in code, matching after normalization.
+    # We bound the candidate window by a length range around len(find_text).
+    n = len(find_text)
+    code_len = len(code)
+    # Search candidate start positions; try anchoring on first non-whitespace word.
+    first_word_match = re.search(r'\S+', find_text)
+    if not first_word_match:
+        return code, False
+    anchor = first_word_match.group(0)
+
+    for m in re.finditer(re.escape(anchor), code):
+        start = m.start()
+        # Try windows around the anchor of varying sizes
+        for delta in (0, 50, 200, 1000):
+            for end in (start + n + delta, start + n - delta):
+                if end <= start or end > code_len:
+                    continue
+                candidate = code[start:end]
+                if _whitespace_normalize(candidate) == target_norm:
+                    return code[:start] + replace_text + code[end:], True
+    return code, False
+
+
 def apply_patches(original_code, patches):
-    """Apply find-and-replace patches to code. Returns (patched_code, errors)."""
+    """Apply find-and-replace patches. Returns (patched_code, errors).
+
+    Errors include the patch index and a short prefix of the `find` text so
+    the auto-retry loop can show Srele exactly which patches missed.
+    """
     code = original_code
     errors = []
     for i, patch in enumerate(patches):
         find_text = patch.get("find", "")
         replace_text = patch.get("replace", "")
-        if find_text and find_text in code:
-            code = code.replace(find_text, replace_text, 1)
-        elif find_text:
-            errors.append(f"Patch {i+1}: couldn't find the text to replace")
+        if not find_text:
+            continue
+        new_code, ok = _fuzzy_find_and_replace(code, find_text, replace_text)
+        if ok:
+            code = new_code
+        else:
+            preview = find_text.strip().split("\n")[0][:80]
+            errors.append(f"Patch {i+1} (find prefix: {preview!r})")
     return code, errors
+
+
+async def auto_retry_failed_patches(channel_id, file_name, current_code, failed_patches_info):
+    """Ask Srele to re-emit corrected PATCH_CODE for patches that failed.
+
+    Returns the new patches list (or None if no usable response).
+    """
+    failure_blob = "\n".join(f"  - {info}" for info in failed_patches_info)
+    prompt = (
+        f"Your previous PATCH_CODE for `{file_name}` partially failed — these patches "
+        f"could not be located in the current file:\n{failure_blob}\n\n"
+        f"Here is the EXACT current content of `{file_name}` (line-numbered for reference):\n\n"
+        f"```python\n{current_code}\n```\n\n"
+        f"Re-emit a NEW PATCH_CODE that contains ONLY the patches that previously failed, "
+        f"with `find` strings copied verbatim from the file above (whitespace and indentation must match exactly). "
+        f"Do not include patches that already succeeded. Output ONLY the PATCH_CODE command, no prose."
+    )
+    response = chat_with_claude(channel_id, "SYSTEM", prompt)
+    _clean, retry_data = parse_patch_command(response)
+    if not retry_data:
+        return None
+    return retry_data.get("patches") or None
 
 
 def parse_set_reminder_command(response_text):
@@ -1370,8 +1463,28 @@ async def on_message(message):
                     patched_code, patch_errors = apply_patches(current_code, push_data["patches"])
 
                     if patch_errors:
-                        await message.reply(f"Some patches failed: {', '.join(patch_errors)}")
-                        return
+                        await message.reply(
+                            f"Some patches missed ({', '.join(patch_errors)}) — "
+                            f"asking Srele to re-emit corrected versions against the live file..."
+                        )
+                        new_patches = await auto_retry_failed_patches(
+                            channel_key, file_name, current_code, patch_errors
+                        )
+                        if not new_patches:
+                            await message.channel.send(
+                                "Auto-retry didn't produce new patches. Push aborted — "
+                                "ask me to re-read the code and try again."
+                            )
+                            return
+                        # Apply the corrected patches to the ORIGINAL code (not the partially-patched one).
+                        patched_code, retry_errors = apply_patches(current_code, new_patches)
+                        if retry_errors:
+                            await message.channel.send(
+                                f"Even the retry missed: {', '.join(retry_errors)}. Push aborted — "
+                                f"the patch context probably doesn't exist in the file at all."
+                            )
+                            return
+                        await message.channel.send("Auto-retry succeeded. Continuing with push...")
 
                     ok, reason = validate_code_before_push(file_name, current_code, patched_code)
                     if not ok:
