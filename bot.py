@@ -1834,6 +1834,18 @@ async def on_ready():
         )
     )
 
+    # Sync slash commands per-guild (instant) instead of global (slow, up to 1h)
+    try:
+        for guild in bot.guilds:
+            synced = await bot.tree.sync(guild=guild)
+            print(f"Synced {len(synced)} slash commands to guild '{guild.name}' ({guild.id})")
+        # Also do a global sync as fallback
+        global_synced = await bot.tree.sync()
+        print(f"Synced {len(global_synced)} slash commands globally")
+    except Exception as e:
+        print(f"Slash command sync FAILED: {e}")
+        log_error(f"Slash sync: {e}")
+
 
 @bot.event
 async def on_message(message):
@@ -2916,10 +2928,7 @@ async def slash_summarize(interaction: discord.Interaction, messages: int = 200)
 # SYNC SLASH COMMANDS ON READY
 # ============================================================
 
-@bot.event
-async def setup_hook():
-    await bot.tree.sync()
-    print("Slash commands synced with Discord")
+# Slash command sync now happens in on_ready (per-guild for instant availability)
 
 
 # ============================================================
