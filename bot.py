@@ -124,6 +124,20 @@ Priority values:
 - "high" — urgent/asap/critical execution priority
 - "normal" — default, no strong signal
 
+LISTING ALL IDEAS / TASKS FROM MONDAY:
+When the user asks you to list, show, or display the current Monday tasks/ideas (e.g. "izlistaj mi sve", "list all tasks", "show me what's on the board", "what's in monday"):
+Output at the END of your message:
+LIST_IDEAS:{"filter": "<optional status filter>", "limit": 50}
+
+Filter values (optional, omit or use "all" for everything):
+- "active" — only items NOT done (default if user wants "current" tasks)
+- "done" — only completed items
+- "working_on_it" — only in-progress
+- "high_intent" / "low_intent" — by intent label
+- "all" — everything
+
+The bot will pull items from Monday and post a formatted embed. Just confirm briefly in chat (e.g. "Idemo, pulam sve aktivne taskove 📋") and emit LIST_IDEAS.
+
 RELABELING / MARKING DONE EXISTING IDEAS:
 When the user asks to re-label, re-categorize, mark as done, or change the status of an existing Monday item (e.g. "mark idea X as high intent", "X je done", "mark the DR whitelist task as done", "set that one to low intent"):
 Output at the END of your message:
@@ -432,6 +446,71 @@ def update_monday_item_priority(item_id, priority_label_id):
     }
     result = monday_request(query, variables)
     return result["data"]["change_multiple_column_values"]
+
+
+def list_monday_items(status_filter=None, limit=50):
+    """List items from the Monday board with their status. Optionally filter by status keyword.
+    Returns a list of dicts: {id, name, status, status_index}.
+    """
+    query = """
+    query ($boardId: [ID!]!, $limit: Int!) {
+        boards(ids: $boardId) {
+            items_page(limit: $limit) {
+                items {
+                    id
+                    name
+                    column_values {
+                        id
+                        text
+                    }
+                }
+            }
+        }
+    }
+    """
+    variables = {"boardId": [str(MONDAY_BOARD_ID)], "limit": limit}
+    result = monday_request(query, variables)
+    items = result["data"]["boards"][0]["items_page"]["items"]
+
+    parsed = []
+    for it in items:
+        status_text = ""
+        for col in it["column_values"]:
+            if col["id"] == COL_PRIORITY and col["text"]:
+                status_text = col["text"]
+                break
+        parsed.append({
+            "id": it["id"],
+            "name": it["name"],
+            "status": status_text or "—",
+        })
+
+    if not status_filter or status_filter == "all":
+        return parsed
+
+    f = status_filter.lower().strip()
+    target_label = None
+    if f in PRIORITY_KEYWORDS:
+        target_label = PRIORITY_LABELS.get(PRIORITY_KEYWORDS[f], "").lower()
+
+    if f == "active":
+        return [p for p in parsed if p["status"].lower() != "done"]
+    if target_label:
+        return [p for p in parsed if p["status"].lower() == target_label]
+    return parsed
+
+
+def parse_list_ideas_command(response_text):
+    """Check if Claude's response contains a LIST_IDEAS command."""
+    match = re.search(r'LIST_IDEAS:(\{.*\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+    try:
+        data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, data
+    except json.JSONDecodeError:
+        return response_text, None
 
 
 def find_monday_item_by_name(query_text, limit=50):
@@ -1922,6 +2001,52 @@ async def on_message(message):
                 embed.set_footer(text=f"id {rem['id']} · in #{message.channel.name}")
                 await message.channel.send(embed=embed)
                 await message.add_reaction("\u23f0")  # alarm clock
+                return
+
+            # Check for LIST_IDEAS — pull and display Monday items
+            display_text, list_data = parse_list_ideas_command(display_text)
+            if list_data:
+                status_filter = list_data.get("filter", "active")
+                try:
+                    list_limit = max(1, min(int(list_data.get("limit", 50)), 100))
+                except (TypeError, ValueError):
+                    list_limit = 50
+
+                if display_text:
+                    await message.reply(display_text)
+
+                try:
+                    items = list_monday_items(status_filter=status_filter, limit=list_limit)
+                except Exception as e:
+                    await message.channel.send(f"Couldn't fetch items: `{str(e)[:80]}`")
+                    return
+
+                if not items:
+                    await message.channel.send(f"No items found (filter: `{status_filter}`).")
+                    return
+
+                # Group by status
+                by_status = {}
+                for it in items:
+                    by_status.setdefault(it["status"], []).append(it)
+
+                embed = discord.Embed(
+                    title=f"Monday Tasks — {status_filter}",
+                    color=0x579bfc,
+                )
+                for status_name, group in by_status.items():
+                    lines = []
+                    for it in group[:15]:
+                        url = f"https://tryreact1s-team.monday.com/boards/{MONDAY_BOARD_ID}/pulses/{it['id']}"
+                        name = it["name"][:80]
+                        lines.append(f"• [{name}]({url})")
+                    value = "\n".join(lines) if lines else "—"
+                    if len(value) > 1024:
+                        value = value[:1020] + "..."
+                    embed.add_field(name=f"{status_name} ({len(group)})", value=value, inline=False)
+
+                embed.set_footer(text=f"{len(items)} item(s) shown")
+                await message.channel.send(embed=embed)
                 return
 
             # Check for relabel command first (updates an existing item)
