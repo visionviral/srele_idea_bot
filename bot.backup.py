@@ -838,6 +838,68 @@ def save_learning(learning_text, taught_by=""):
 
 REMINDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminders.json")
 RECURRING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recurring.json")
+TIMEZONES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "timezones.json")
+
+# Cached user timezones {discord_user_id (str): tz_name (str)}
+srele_timezones = {}
+
+
+def load_timezones():
+    """Load user timezones from timezones.json."""
+    global srele_timezones
+    try:
+        with open(TIMEZONES_FILE, "r") as f:
+            data = json.load(f)
+            srele_timezones = data.get("timezones", {})
+            print(f"Loaded {len(srele_timezones)} user timezones from {TIMEZONES_FILE}")
+    except FileNotFoundError:
+        srele_timezones = {}
+        print("No timezones file yet, starting empty")
+    except Exception as e:
+        srele_timezones = {}
+        print(f"Could not load timezones: {e}")
+
+
+def save_user_timezone(user_id, tz_name):
+    """Persist a single user's timezone. Returns (ok, error_msg)."""
+    global srele_timezones
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            ZoneInfo(tz_name)
+        except ZoneInfoNotFoundError:
+            return False, f"`{tz_name}` is not a valid IANA timezone. Try things like `Europe/Zagreb`, `America/New_York`, `Asia/Tokyo`."
+    except Exception as e:
+        return False, f"Couldn't validate timezone: {e}"
+
+    srele_timezones[str(user_id)] = tz_name
+    try:
+        with open(TIMEZONES_FILE, "w") as f:
+            json.dump({"timezones": srele_timezones}, f, indent=2, ensure_ascii=False)
+        return True, None
+    except Exception as e:
+        return False, f"Couldn't save: {e}"
+
+
+def get_user_local_time(user_id):
+    """Return (datetime_in_their_tz, tz_name) or (None, None) if not registered."""
+    tz_name = srele_timezones.get(str(user_id))
+    if not tz_name:
+        return None, None
+    try:
+        from zoneinfo import ZoneInfo
+        now_local = datetime.datetime.now(ZoneInfo(tz_name))
+        return now_local, tz_name
+    except Exception:
+        return None, tz_name
+
+
+def format_local_time_for_user(user_id):
+    """Human-readable 'Mon 14:32 CEST' or None if user has no TZ set."""
+    dt, tz_name = get_user_local_time(user_id)
+    if not dt:
+        return None
+    return dt.strftime("%a %H:%M %Z") or dt.strftime(f"%a %H:%M {tz_name}")
 
 # Cached recurring reminders (loaded on startup)
 # Each entry: {id, schedule, channel_id, message, mentions, next_fire_unix, created_by, created_at_unix}
@@ -1761,6 +1823,7 @@ async def on_ready():
     # Load reminders from reminders.json on startup, then start the dispatch loop
     load_reminders()
     load_recurring()
+    load_timezones()
     if not reminder_loop.is_running():
         reminder_loop.start()
 
@@ -2733,6 +2796,88 @@ async def slash_confirm(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"Confirm error: `{str(e)[:100]}`")
         print(f"Confirm error: {e}")
+
+
+@bot.tree.command(name="settz", description="Register your timezone (e.g. Europe/Zagreb, America/New_York)")
+async def slash_settz(interaction: discord.Interaction, timezone: str):
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    tz_clean = timezone.strip().replace(" ", "_")
+    ok, err = save_user_timezone(interaction.user.id, tz_clean)
+    if not ok:
+        await interaction.followup.send(err, ephemeral=True)
+        return
+    dt, _ = get_user_local_time(interaction.user.id)
+    when = dt.strftime("%A %H:%M %Z") if dt else "now"
+    await interaction.followup.send(
+        f"✅ Timezone set to **`{tz_clean}`**. Your local time is **{when}**.",
+        ephemeral=True,
+    )
+    print(f"Set timezone for {interaction.user.name}: {tz_clean}")
+
+
+@bot.tree.command(name="time", description="Show a user's current local time")
+async def slash_time(interaction: discord.Interaction, user: discord.Member = None):
+    await interaction.response.defer(thinking=True)
+    target = user or interaction.user
+    dt, tz_name = get_user_local_time(target.id)
+    if not dt:
+        if target.id == interaction.user.id:
+            await interaction.followup.send(
+                "You haven't registered your timezone yet. Run `/settz Europe/Zagreb` (or whatever yours is)."
+            )
+        else:
+            await interaction.followup.send(
+                f"**{target.display_name}** hasn't registered a timezone yet. They can run `/settz <timezone>` to set one."
+            )
+        return
+    when = dt.strftime("%A %B %d, %H:%M %Z")
+    embed = discord.Embed(
+        title=f"🕒 {target.display_name}'s local time",
+        description=f"**{when}**\n`{tz_name}`",
+        color=0x579bfc,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="timezones", description="Show everyone's registered timezone and current local time")
+async def slash_timezones(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    if not srele_timezones:
+        await interaction.followup.send("No one has registered a timezone yet. Run `/settz <timezone>` to be the first.")
+        return
+
+    try:
+        from zoneinfo import ZoneInfo
+    except Exception:
+        await interaction.followup.send("Timezone library unavailable on this Python build.")
+        return
+
+    rows = []
+    for uid, tz_name in srele_timezones.items():
+        try:
+            now_local = datetime.datetime.now(ZoneInfo(tz_name))
+            offset_sec = now_local.utcoffset().total_seconds() if now_local.utcoffset() else 0
+        except Exception:
+            now_local = None
+            offset_sec = 0
+
+        member = interaction.guild.get_member(int(uid)) if uid.isdigit() else None
+        if not member:
+            try:
+                member = await interaction.guild.fetch_member(int(uid))
+            except Exception:
+                member = None
+        display = member.display_name if member else f"User {uid}"
+        when = now_local.strftime("%a %H:%M %Z") if now_local else "?"
+        rows.append((offset_sec, display, tz_name, when))
+
+    rows.sort(key=lambda r: r[0])
+
+    embed = discord.Embed(title="🌍 Team Timezones", color=0x9d50dd)
+    for _offset, display, tz_name, when in rows:
+        embed.add_field(name=display, value=f"**{when}**\n`{tz_name}`", inline=True)
+    embed.set_footer(text=f"{len(rows)} member(s) registered · sorted west to east")
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="summarize", description="Summarize the recent conversation in this channel")
