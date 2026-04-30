@@ -196,6 +196,31 @@ The reminder message should be short and direct. The bot will fire it in the SAM
 
 When you set a reminder, briefly confirm in chat (e.g. "Got it — remindam te sutra u 9 ujutro 🫡") and then emit the SET_REMINDER command.
 
+SETTING RECURRING REMINDERS (repeating cron-style schedules):
+When the user asks for a REPEATING reminder ("every Monday", "daily at 9am", "every weekday", "svaki ponedjeljak", "each month on the 1st"):
+Output at the END of your message:
+SET_RECURRING:{"schedule": "<schedule string>", "message": "<reminder text>", "mentions": ["Antonio"]}
+
+Schedule format (interpreted in Europe/Zagreb):
+- "weekly:monday:09:00" — every Monday at 09:00 (use english weekday names: monday/tuesday/wednesday/thursday/friday/saturday/sunday)
+- "daily:08:30" — every day at 08:30
+- "weekday:09:00" — every Mon-Fri at 09:00
+- "monthly:1:09:00" — 1st of every month at 09:00
+
+Examples:
+- "every Monday at 9am ask me top 3 priorities" → schedule: "weekly:monday:09:00"
+- "each weekday morning at 8:30 say good morning" → schedule: "weekday:08:30"
+- "daily at 22:00 remind me to log workout" → schedule: "daily:22:00"
+
+LISTING RECURRING REMINDERS:
+When user asks "what recurring reminders do I have", "list my recurring", "show schedules":
+Output: LIST_RECURRING:{}
+
+CANCELING A RECURRING REMINDER:
+When user wants to stop/cancel/delete a recurring reminder ("cancel the Monday reminder", "stop the daily standup"):
+Output: CANCEL_RECURRING:{"query": "<text matching the reminder message or schedule>"}
+The bot will find the recurring entry by partial match on message or schedule and remove it.
+
 READING CHAT HISTORY (deep scan):
 By default you only see the last 50 messages of the current channel. When the user asks you to look further back, audit past conversations, or read a different channel, output at the END of your message:
 READ_HISTORY:{"channel": "<channel-name or empty for current>", "limit": 300}
@@ -220,7 +245,7 @@ SEND_MESSAGE:{"channel": "<channel-name>", "message": "<the message to send>"}
 - Always confirm to the user that you'll send the message.
 
 RULES:
-- Only output ONE command per message (SAVE_IDEA, RELABEL_IDEA, SAVE_LEARNING, SET_REMINDER, PUSH_CODE, SEND_MESSAGE, READ_CODE, READ_HISTORY, or GENERATE_IMAGE — never combine them)
+- Only output ONE command per message (SAVE_IDEA, RELABEL_IDEA, SAVE_LEARNING, SET_REMINDER, SET_RECURRING, LIST_RECURRING, CANCEL_RECURRING, PUSH_CODE, SEND_MESSAGE, READ_CODE, READ_HISTORY, or GENERATE_IMAGE — never combine them)
 - Place the command at the END, after your conversational response
 - For Discord, keep chat responses reasonably concise but don't sacrifice quality
 - For code and technical answers, be as thorough as needed
@@ -812,6 +837,11 @@ def save_learning(learning_text, taught_by=""):
 
 
 REMINDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminders.json")
+RECURRING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recurring.json")
+
+# Cached recurring reminders (loaded on startup)
+# Each entry: {id, schedule, channel_id, message, mentions, next_fire_unix, created_by, created_at_unix}
+srele_recurring = []
 
 
 def load_reminders():
@@ -910,6 +940,216 @@ def parse_due_at(reminder_data, now_unix=None):
             print(f"parse_due_at: failed to parse '{s}': {e}")
 
     return None
+
+
+# ============================================================
+# RECURRING REMINDERS — cron-style repeating schedules
+# ============================================================
+
+def load_recurring():
+    """Load recurring reminders from recurring.json."""
+    global srele_recurring
+    try:
+        with open(RECURRING_FILE, "r") as f:
+            data = json.load(f)
+            srele_recurring = data.get("recurring", [])
+            print(f"Loaded {len(srele_recurring)} recurring reminders from {RECURRING_FILE}")
+    except FileNotFoundError:
+        srele_recurring = []
+        print("No recurring file yet, starting empty")
+    except Exception as e:
+        srele_recurring = []
+        print(f"Could not load recurring: {e}")
+
+
+def _persist_recurring():
+    try:
+        with open(RECURRING_FILE, "w") as f:
+            json.dump({"recurring": srele_recurring}, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Could not save recurring: {e}")
+
+
+WEEKDAY_NAMES = {
+    "monday": 0, "mon": 0, "ponedjeljak": 0, "pon": 0,
+    "tuesday": 1, "tue": 1, "utorak": 1, "uto": 1,
+    "wednesday": 2, "wed": 2, "srijeda": 2, "sri": 2,
+    "thursday": 3, "thu": 3, "četvrtak": 3, "cetvrtak": 3, "cet": 3,
+    "friday": 4, "fri": 4, "petak": 4, "pet": 4,
+    "saturday": 5, "sat": 5, "subota": 5, "sub": 5,
+    "sunday": 6, "sun": 6, "nedjelja": 6, "ned": 6,
+}
+
+
+def compute_next_fire(schedule, now_unix=None):
+    """Compute the next unix timestamp this schedule should fire.
+
+    Supported schedule formats (all interpreted in Europe/Zagreb):
+      - 'weekly:monday:09:00'    every Monday at 09:00
+      - 'daily:08:30'            every day at 08:30
+      - 'weekday:09:00'          Mon-Fri at 09:00
+      - 'monthly:1:09:00'        1st of every month at 09:00
+
+    Returns int unix seconds, or None if format invalid.
+    """
+    if now_unix is None:
+        now_unix = int(time.time())
+
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(LOCAL_TZ_NAME)
+    except Exception:
+        tz = datetime.timezone.utc
+
+    now_local = datetime.datetime.fromtimestamp(now_unix, tz=tz)
+    parts = schedule.lower().strip().split(":")
+    if not parts:
+        return None
+
+    kind = parts[0]
+
+    try:
+        if kind == "daily" and len(parts) >= 3:
+            hh, mm = int(parts[1]), int(parts[2])
+            cand = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if cand <= now_local:
+                cand += datetime.timedelta(days=1)
+            return int(cand.timestamp())
+
+        if kind == "weekly" and len(parts) >= 4:
+            day_name = parts[1]
+            hh, mm = int(parts[2]), int(parts[3])
+            target_dow = WEEKDAY_NAMES.get(day_name)
+            if target_dow is None:
+                return None
+            cand = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            days_ahead = (target_dow - cand.weekday()) % 7
+            if days_ahead == 0 and cand <= now_local:
+                days_ahead = 7
+            cand += datetime.timedelta(days=days_ahead)
+            return int(cand.timestamp())
+
+        if kind == "weekday" and len(parts) >= 3:
+            hh, mm = int(parts[1]), int(parts[2])
+            cand = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if cand <= now_local:
+                cand += datetime.timedelta(days=1)
+            while cand.weekday() >= 5:
+                cand += datetime.timedelta(days=1)
+            return int(cand.timestamp())
+
+        if kind == "monthly" and len(parts) >= 4:
+            day_of_month = int(parts[1])
+            hh, mm = int(parts[2]), int(parts[3])
+            cand = now_local.replace(day=min(day_of_month, 28), hour=hh, minute=mm, second=0, microsecond=0)
+            if cand <= now_local:
+                month = cand.month + 1
+                year = cand.year
+                if month > 12:
+                    month = 1
+                    year += 1
+                cand = cand.replace(year=year, month=month)
+            return int(cand.timestamp())
+    except (ValueError, IndexError) as e:
+        print(f"compute_next_fire: bad schedule '{schedule}': {e}")
+        return None
+
+    return None
+
+
+def add_recurring(schedule, channel_id, msg_text, mentions=None, created_by=""):
+    """Add a new recurring reminder. Computes first fire time automatically."""
+    global srele_recurring
+    next_fire = compute_next_fire(schedule)
+    if not next_fire:
+        return None
+    rec = {
+        "id": int(time.time() * 1000),
+        "schedule": schedule,
+        "channel_id": str(channel_id),
+        "message": msg_text,
+        "mentions": mentions or [],
+        "next_fire_unix": next_fire,
+        "created_by": created_by,
+        "created_at_unix": int(time.time()),
+    }
+    srele_recurring.append(rec)
+    _persist_recurring()
+    return rec
+
+
+def remove_recurring(rec_id):
+    """Cancel a recurring reminder by ID. Returns True if removed."""
+    global srele_recurring
+    before = len(srele_recurring)
+    srele_recurring = [r for r in srele_recurring if r.get("id") != rec_id]
+    if len(srele_recurring) < before:
+        _persist_recurring()
+        return True
+    return False
+
+
+def pop_due_recurring(now_unix=None):
+    """Find recurring reminders that are due to fire.
+
+    Unlike one-shot, these aren't deleted — instead next_fire_unix is advanced
+    to the next occurrence. Returns the list of recurring entries that should fire NOW.
+    """
+    global srele_recurring
+    if now_unix is None:
+        now_unix = int(time.time())
+    due = [r for r in srele_recurring if r.get("next_fire_unix", 0) <= now_unix]
+    if due:
+        for r in due:
+            next_fire = compute_next_fire(r["schedule"], now_unix=now_unix + 60)
+            if next_fire:
+                r["next_fire_unix"] = next_fire
+            else:
+                r["next_fire_unix"] = now_unix + 86400 * 365
+        _persist_recurring()
+    return due
+
+
+def parse_set_recurring_command(response_text):
+    """Check if Claude's response contains a SET_RECURRING command."""
+    match = re.search(r'SET_RECURRING:(\{.*\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+    try:
+        data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, data
+    except json.JSONDecodeError:
+        return response_text, None
+
+
+def parse_list_recurring_command(response_text):
+    """Check if Claude's response contains a LIST_RECURRING command."""
+    match = re.search(r'LIST_RECURRING:(\{.*\})', response_text, re.DOTALL)
+    if not match:
+        if "LIST_RECURRING" in response_text:
+            clean_text = response_text.replace("LIST_RECURRING", "").rstrip()
+            return clean_text, {}
+        return response_text, None
+    try:
+        data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, data
+    except json.JSONDecodeError:
+        return response_text, None
+
+
+def parse_cancel_recurring_command(response_text):
+    """Check if Claude's response contains a CANCEL_RECURRING command."""
+    match = re.search(r'CANCEL_RECURRING:(\{.*\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+    try:
+        data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, data
+    except json.JSONDecodeError:
+        return response_text, None
 
 
 def format_due_for_user(due_at_unix):
@@ -1446,11 +1686,10 @@ bot = commands.Bot(command_prefix="!srele ", intents=intents)
 
 @tasks.loop(seconds=30)
 async def reminder_loop():
-    """Every 30s: fire any due reminders, ping the listed users in their original channel."""
+    """Every 30s: fire any due one-shot reminders AND any due recurring reminders."""
+    # --- One-shot reminders ---
     try:
         due = pop_due_reminders()
-        if not due:
-            return
         for rem in due:
             try:
                 channel = bot.get_channel(int(rem["channel_id"]))
@@ -1474,7 +1713,35 @@ async def reminder_loop():
             except Exception as e:
                 print(f"reminder_loop: failed to deliver reminder {rem.get('id')}: {e}")
     except Exception as e:
-        print(f"reminder_loop crashed: {e}")
+        print(f"reminder_loop (one-shot) crashed: {e}")
+
+    # --- Recurring reminders ---
+    try:
+        due_rec = pop_due_recurring()
+        for rec in due_rec:
+            try:
+                channel = bot.get_channel(int(rec["channel_id"]))
+                if channel is None:
+                    try:
+                        channel = await bot.fetch_channel(int(rec["channel_id"]))
+                    except Exception as e:
+                        print(f"reminder_loop: recurring channel {rec['channel_id']} unreachable: {e}")
+                        continue
+
+                ping_text = ""
+                if rec.get("mentions"):
+                    ping_text = " ".join(f"{{{{{n}}}}}" for n in rec["mentions"])
+                    ping_text = await resolve_mentions(channel.guild, ping_text)
+                    ping_text = ping_text.strip()
+
+                body = f"\U0001f504 {rec['message']}"
+                full = f"{ping_text}\n{body}" if ping_text else body
+                await channel.send(full)
+                print(f"Fired recurring {rec['id']} ({rec['schedule']}) in #{channel.name}")
+            except Exception as e:
+                print(f"reminder_loop: failed to deliver recurring {rec.get('id')}: {e}")
+    except Exception as e:
+        print(f"reminder_loop (recurring) crashed: {e}")
 
 
 @reminder_loop.before_loop
@@ -1493,6 +1760,7 @@ async def on_ready():
 
     # Load reminders from reminders.json on startup, then start the dispatch loop
     load_reminders()
+    load_recurring()
     if not reminder_loop.is_running():
         reminder_loop.start()
 
@@ -2001,6 +2269,102 @@ async def on_message(message):
                 embed.set_footer(text=f"id {rem['id']} · in #{message.channel.name}")
                 await message.channel.send(embed=embed)
                 await message.add_reaction("\u23f0")  # alarm clock
+                return
+
+            # Check for SET_RECURRING — schedule a repeating reminder
+            display_text, recurring_data = parse_set_recurring_command(display_text)
+            if recurring_data:
+                schedule = (recurring_data.get("schedule") or "").strip()
+                msg_text = (recurring_data.get("message") or "").strip()
+                mentions = recurring_data.get("mentions") or []
+
+                if display_text:
+                    await message.reply(display_text)
+
+                if not schedule or not msg_text:
+                    await message.channel.send("Couldn't set recurring — missing schedule or message.")
+                    return
+
+                rec = add_recurring(
+                    schedule=schedule,
+                    channel_id=message.channel.id,
+                    msg_text=msg_text,
+                    mentions=mentions,
+                    created_by=message.author.display_name,
+                )
+                if not rec:
+                    await message.channel.send(
+                        f"Couldn't parse schedule `{schedule}`. Use formats like "
+                        f"`weekly:monday:09:00`, `daily:08:30`, `weekday:09:00`, `monthly:1:09:00`."
+                    )
+                    return
+
+                next_when = format_due_for_user(rec["next_fire_unix"])
+                mention_preview = ", ".join(mentions) if mentions else "—"
+                embed = discord.Embed(
+                    title="Recurring reminder set",
+                    description=msg_text,
+                    color=0x9d50dd,
+                )
+                embed.add_field(name="Schedule", value=f"`{schedule}`", inline=False)
+                embed.add_field(name="Next fire", value=next_when, inline=False)
+                embed.add_field(name="Will ping", value=mention_preview, inline=True)
+                embed.set_footer(text=f"id {rec['id']} · in #{message.channel.name}")
+                await message.channel.send(embed=embed)
+                await message.add_reaction("\U0001f504")
+                return
+
+            # Check for LIST_RECURRING
+            display_text, list_rec_data = parse_list_recurring_command(display_text)
+            if list_rec_data is not None:
+                if display_text:
+                    await message.reply(display_text)
+
+                if not srele_recurring:
+                    await message.channel.send("No recurring reminders set up yet.")
+                    return
+
+                embed = discord.Embed(title="Recurring Reminders", color=0x9d50dd)
+                for r in srele_recurring[:25]:
+                    next_when = format_due_for_user(r.get("next_fire_unix", 0))
+                    mentions_str = ", ".join(r.get("mentions", [])) or "—"
+                    chan_id = r.get("channel_id", "?")
+                    chan = bot.get_channel(int(chan_id)) if str(chan_id).isdigit() else None
+                    chan_name = f"#{chan.name}" if chan else f"channel {chan_id}"
+                    embed.add_field(
+                        name=f"`{r['schedule']}` · id {r['id']}",
+                        value=f"{r['message'][:200]}\n\n**Next:** {next_when}\n**Pings:** {mentions_str} · {chan_name}",
+                        inline=False,
+                    )
+                embed.set_footer(text=f"{len(srele_recurring)} recurring reminder(s)")
+                await message.channel.send(embed=embed)
+                return
+
+            # Check for CANCEL_RECURRING
+            display_text, cancel_rec_data = parse_cancel_recurring_command(display_text)
+            if cancel_rec_data:
+                q = (cancel_rec_data.get("query") or "").lower().strip()
+                if display_text:
+                    await message.reply(display_text)
+
+                if not q:
+                    await message.channel.send("Need a query to find which recurring to cancel.")
+                    return
+
+                target = None
+                for r in srele_recurring:
+                    if q in r.get("message", "").lower() or q in r.get("schedule", "").lower() or q == str(r.get("id", "")):
+                        target = r
+                        break
+
+                if not target:
+                    await message.channel.send(f"Couldn't find a recurring reminder matching `{q}`.")
+                    return
+
+                if remove_recurring(target["id"]):
+                    await message.channel.send(f"\u2705 Cancelled recurring: **{target['message'][:100]}** (`{target['schedule']}`)")
+                else:
+                    await message.channel.send("Failed to remove (already gone?)")
                 return
 
             # Check for LIST_IDEAS — pull and display Monday items
