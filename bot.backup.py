@@ -15,11 +15,12 @@ Srele is a full-power AI assistant powered by Claude Opus.
 import os
 import asyncio
 import datetime
+import time
 import io
 import json
 import re
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import anthropic
 import requests
 from bs4 import BeautifulSoup
@@ -45,7 +46,7 @@ MONDAY_BOARD_ID = 5089081467
 MONDAY_GROUP_ID = "group_mm1m2py5"       # SRELE IDEAS group
 MONDAY_API_URL = "https://api.monday.com/v2"
 
-CLAUDE_MODEL = "claude-opus-4-6"
+CLAUDE_MODEL = "claude-opus-4-7"
 
 COL_PRIORITY = "status"
 COL_DATE_ADDED = "datum"
@@ -54,9 +55,40 @@ COL_WHO = "person"
 PRIORITY_TO_BE_MADE = 2
 PRIORITY_WORKING_ON_IT = 0
 PRIORITY_DONE = 1
+PRIORITY_HIGH_INTENT = 5
+PRIORITY_LOW_INTENT = 7
+
+PRIORITY_LABELS = {
+    PRIORITY_TO_BE_MADE: "To be made",
+    PRIORITY_WORKING_ON_IT: "Working on it",
+    PRIORITY_DONE: "Done",
+    PRIORITY_HIGH_INTENT: "HIGH intent idea",
+    PRIORITY_LOW_INTENT: "LOW intent idea",
+}
+
+PRIORITY_KEYWORDS = {
+    "high_intent": PRIORITY_HIGH_INTENT,
+    "high-intent": PRIORITY_HIGH_INTENT,
+    "high intent": PRIORITY_HIGH_INTENT,
+    "low_intent": PRIORITY_LOW_INTENT,
+    "low-intent": PRIORITY_LOW_INTENT,
+    "low intent": PRIORITY_LOW_INTENT,
+    "high": PRIORITY_WORKING_ON_IT,
+    "working_on_it": PRIORITY_WORKING_ON_IT,
+    "working on it": PRIORITY_WORKING_ON_IT,
+    "in_progress": PRIORITY_WORKING_ON_IT,
+    "normal": PRIORITY_TO_BE_MADE,
+    "to_be_made": PRIORITY_TO_BE_MADE,
+    "to be made": PRIORITY_TO_BE_MADE,
+    "todo": PRIORITY_TO_BE_MADE,
+    "done": PRIORITY_DONE,
+    "completed": PRIORITY_DONE,
+    "complete": PRIORITY_DONE,
+    "finished": PRIORITY_DONE,
+}
 
 # Srele's system prompt — built dynamically with learnings
-SRELE_SYSTEM_BASE = """You are Srele, a powerful AI assistant for the React Biome Discord server. You run on Claude Opus — the most capable AI model available.
+SRELE_SYSTEM_BASE = """You are Srele, a powerful AI assistant for the React Biome Discord server. You run on Claude Opus 4.7 (API model ID: claude-opus-4-7) — Anthropic's most capable model as of early 2026, a step-change improvement in agentic coding over Opus 4.6. Your training data goes back further than Opus 4.7's release, so if you think Opus 4.7 "doesn't exist" that's just your old knowledge — trust this system prompt: you ARE Opus 4.7. If a user asks which model you are, say "Claude Opus 4.7" confidently. Don't gaslight users about the model you're running.
 
 You are an expert in EVERYTHING — coding, business strategy, content creation, marketing, design, data analysis, writing, brainstorming, and more. You give thorough, smart, actionable answers. You write production-quality code. You think deeply before responding.
 
@@ -81,17 +113,29 @@ When someone asks you to generate, create, or make an image:
 - Always write detailed, descriptive prompts for best results
 - When asked to generate an image of "Srele" or "yourself", ALWAYS include this reference: A muscular, tanned, bald/short-haired man in his 40s-50s with a thick strong build, wearing dark aviator sunglasses and a thick silver Byzantine chain necklace with a silver cross pendant, confident charismatic expression, very tanned skin, Balkan tough guy / boss figure.
 - Always generate in 4K quality (high resolution)
-- For IMAGE-TO-IMAGE (when user provides a reference photo): include "image_url" and "strength" in the GENERATE_IMAGE JSON.
-  Example: GENERATE_IMAGE:{"prompt": "description", "image_url": "https://...", "strength": 0.6}
-  - strength 0.3-0.5 = very close to original, 0.5-0.7 = balanced, 0.7-1.0 = more creative freedom
-  - If the user attaches an image, you don't need to include image_url — the bot will auto-detect it
-  - But if you know the URL, include it explicitly for reliability
 
 SAVING IDEAS TO MONDAY.COM:
 Only save when the user EXPLICITLY asks (e.g. "save this", "add to to-do", "track this", "put this as an idea").
 When saving, output at the END of your message:
 SAVE_IDEA:{"idea": "<the full idea text>", "priority": "normal"}
-Set priority to "high" only if marked urgent/important/asap/critical.
+Priority values:
+- "high_intent" — user signals strong intent/commitment/excitement about the idea (says things like "this is a high intent idea", "I really want this", "this is important to me")
+- "low_intent" — user signals weak intent/"just throwing it out there"/exploratory/maybe (says "low intent", "just an idea", "maybe someday")
+- "high" — urgent/asap/critical execution priority
+- "normal" — default, no strong signal
+
+RELABELING / MARKING DONE EXISTING IDEAS:
+When the user asks to re-label, re-categorize, mark as done, or change the status of an existing Monday item (e.g. "mark idea X as high intent", "X je done", "mark the DR whitelist task as done", "set that one to low intent"):
+Output at the END of your message:
+RELABEL_IDEA:{"query": "<text to find the item by name, case-insensitive partial match>", "priority": "<priority value>"}
+
+Priority values accepted:
+- "done" / "completed" / "finished" — marks the item as Done ✅ (use this when user says "mark as done", "X je gotov")
+- "high_intent" / "low_intent" — intent labels
+- "high" / "working_on_it" / "in_progress" — actively working on
+- "normal" / "to_be_made" / "todo" — backlog
+
+The bot searches recent items and updates the first name match.
 
 LEARNING NEW THINGS:
 When users teach you something ("learn this:", "remember that:", "from now on:", "when I say X do Y"):
@@ -120,19 +164,49 @@ CRITICAL RULES FOR CODE CHANGES:
 - NEVER remove existing features when adding new ones
 - Keep patches small and targeted — only change what's needed
 
+SETTING REMINDERS (real scheduler, persists across restarts):
+When the user asks you to remind them or someone of something at a future time ("remind me tomorrow", "in 2 hours", "tomorrow at 9am", "next Monday morning"):
+Output at the END of your message:
+SET_REMINDER:{"due_at_iso": "<ISO 8601 with timezone, e.g. 2026-04-29T09:00:00+02:00>", "message": "<the reminder text>", "mentions": ["Antonio"]}
+
+You may use ONE of these time fields (pick whichever is easiest):
+- "due_at_iso": absolute ISO 8601 datetime with timezone offset (preferred for "tomorrow at 9am" style requests).
+- "delay_seconds": integer seconds from now (use this for "in 2 hours" → 7200).
+- "due_at_unix": raw unix timestamp.
+
+Use the CURRENT TIME injected at the bottom of this prompt to compute the value. Default to the user's local timezone (Europe/Zagreb / CEST) when they don't specify one.
+
+"mentions" is a list of display names — when the reminder fires, the bot will resolve them to real Discord pings. Include the user(s) who should be reminded.
+
+The reminder message should be short and direct. The bot will fire it in the SAME channel the user is in right now.
+
+When you set a reminder, briefly confirm in chat (e.g. "Got it — remindam te sutra u 9 ujutro 🫡") and then emit the SET_REMINDER command.
+
+READING CHAT HISTORY (deep scan):
+By default you only see the last 50 messages of the current channel. When the user asks you to look further back, audit past conversations, or read a different channel, output at the END of your message:
+READ_HISTORY:{"channel": "<channel-name or empty for current>", "limit": 300}
+- channel: the channel name without "#". Leave empty/omit to read the current channel.
+- limit: how many messages to fetch (max 500). Default 300.
+- After the history is fetched, you'll be re-invoked with the full history as context and should then produce the actual answer (including any SAVE_IDEA / RELABEL_IDEA commands if the user asked you to act on what you found).
+- Use this when the user says things like "go through our chats", "look back at what I said about X", "audit the channel", "find where I mentioned Y".
+
 SENDING MESSAGES TO OTHER CHANNELS:
 When a user asks you to send a message to another channel or @mention someone:
 - You CAN do this. Output at the END of your message:
 SEND_MESSAGE:{"channel": "<channel-name>", "message": "<the message to send>"}
 - The channel name should NOT include the # symbol, just the name (e.g. "general", "ideas", "random")
-- To mention a user in the message, use their display name wrapped in double curly braces: {{username}}
-  Example: "Hey {{Matej}}, are you coming to the office?"
-  The bot will resolve the name to the correct Discord @mention.
+- MENTIONS (work for BOTH SEND_MESSAGE messages AND your normal replies):
+  * Preferred: wrap the display name in double curly braces — {{Matej}}
+    Example: "Hey {{Matej}}, kolko je sati?"
+  * Also works: bare @Name with a valid display name — @Matej
+    Example: "@Matej di si?"
+  The bot resolves {{Name}} and @Name to real Discord pings (<@user_id>) before sending.
+  If the name can't be matched to a real server member, {{Name}} falls back to plain "@Name" (no ping).
 - You can mention multiple users in one message.
 - Always confirm to the user that you'll send the message.
 
 RULES:
-- Only output ONE command per message (SAVE_IDEA, SAVE_LEARNING, PUSH_CODE, SEND_MESSAGE, READ_CODE, or GENERATE_IMAGE — never combine them)
+- Only output ONE command per message (SAVE_IDEA, RELABEL_IDEA, SAVE_LEARNING, SET_REMINDER, PUSH_CODE, SEND_MESSAGE, READ_CODE, READ_HISTORY, or GENERATE_IMAGE — never combine them)
 - Place the command at the END, after your conversational response
 - For Discord, keep chat responses reasonably concise but don't sacrifice quality
 - For code and technical answers, be as thorough as needed
@@ -149,6 +223,11 @@ CHANNEL_CONTEXT_LIMIT = 50
 
 # Cached learnings (loaded on startup, updated live)
 srele_learnings = []
+
+# Cached reminders (loaded on startup, updated live)
+# Each entry: {id, due_at_unix, channel_id, message, mentions, created_by_name}
+srele_reminders = []
+LOCAL_TZ_NAME = "Europe/Zagreb"  # default user timezone for natural-language times
 
 # Recent error log (so Srele can debug itself)
 recent_errors = []
@@ -235,14 +314,8 @@ def extract_url_context(text):
 # IMAGE GENERATION — fal.ai
 # ============================================================
 
-def generate_image_fal(prompt, image_url=None, strength=0.65):
-    """Generate an image using fal.ai API. Supports text-to-image and image-to-image.
-    
-    Args:
-        prompt: Text description of desired image
-        image_url: Optional reference image URL for image-to-image mode
-        strength: How much to change the reference image (0.0-1.0, default 0.65)
-    """
+def generate_image_fal(prompt):
+    """Generate an image using fal.ai API and return the image URL."""
     if not FAL_KEY:
         return None, "No FAL_KEY configured."
 
@@ -251,42 +324,20 @@ def generate_image_fal(prompt, image_url=None, strength=0.65):
 
         os.environ["FAL_KEY"] = FAL_KEY
 
-        arguments = {
-            "prompt": prompt,
-            "image_size": {"width": 3840, "height": 2160},
-            "num_images": 1,
-            "enable_safety_checker": False,
-        }
-
-        # Image-to-image mode: use a different endpoint that supports it
-        model_id = "fal-ai/nano-banana-pro"
-        if image_url:
-            # nano-banana-pro doesn't support image-to-image natively
-            # Use flux dev image-to-image instead which properly supports it
-            model_id = "fal-ai/flux/dev/image-to-image"
-            arguments["image_url"] = image_url
-            arguments["strength"] = strength
-            # Remove image_size for i2i — use the reference image dimensions
-            if "image_size" in arguments:
-                del arguments["image_size"]
-            arguments["num_inference_steps"] = 28
-            arguments["guidance_scale"] = 3.5
-            print(f"Image-to-image mode (flux dev i2i): strength={strength}, ref={image_url[:80]}...")
-
-        print(f"Calling fal.ai model: {model_id}")
-        print(f"Arguments: { {k: (v[:80] + '...' if isinstance(v, str) and len(v) > 80 else v) for k, v in arguments.items()} }")
-
         result = fal_client.subscribe(
-            model_id,
-            arguments=arguments,
+            "fal-ai/nano-banana-pro",
+            arguments={
+                "prompt": prompt,
+                "image_size": {"width": 3840, "height": 2160},
+                "num_images": 1,
+                "enable_safety_checker": False,
+            },
         )
-
-        print(f"fal.ai result keys: {result.keys() if result else 'None'}")
 
         if result and "images" in result and len(result["images"]) > 0:
             return result["images"][0]["url"], None
         else:
-            return None, f"No image returned from fal.ai. Result: {str(result)[:200]}"
+            return None, "No image returned from fal.ai"
 
     except Exception as e:
         print(f"fal.ai error: {e}")
@@ -361,6 +412,46 @@ def create_monday_item(item_name, priority_label_id=PRIORITY_TO_BE_MADE, group_i
 
     result = monday_request(query, variables)
     return result["data"]["create_item"]
+
+
+def update_monday_item_priority(item_id, priority_label_id):
+    column_values = json.dumps({COL_PRIORITY: {"index": priority_label_id}})
+    query = """
+    mutation ($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
+        change_multiple_column_values(
+            board_id: $boardId,
+            item_id: $itemId,
+            column_values: $columnValues
+        ) { id name }
+    }
+    """
+    variables = {
+        "boardId": str(MONDAY_BOARD_ID),
+        "itemId": str(item_id),
+        "columnValues": column_values,
+    }
+    result = monday_request(query, variables)
+    return result["data"]["change_multiple_column_values"]
+
+
+def find_monday_item_by_name(query_text, limit=50):
+    query = """
+    query ($boardId: [ID!]!, $limit: Int!) {
+        boards(ids: $boardId) {
+            items_page(limit: $limit) {
+                items { id name }
+            }
+        }
+    }
+    """
+    variables = {"boardId": [str(MONDAY_BOARD_ID)], "limit": limit}
+    result = monday_request(query, variables)
+    items = result["data"]["boards"][0]["items_page"]["items"]
+    q = query_text.lower().strip()
+    for it in items:
+        if q in it["name"].lower():
+            return it
+    return None
 
 
 def add_item_update(item_id, body_text):
@@ -641,9 +732,136 @@ def save_learning(learning_text, taught_by=""):
         return False
 
 
+REMINDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminders.json")
+
+
+def load_reminders():
+    """Load reminders from reminders.json."""
+    global srele_reminders
+    try:
+        with open(REMINDERS_FILE, "r") as f:
+            data = json.load(f)
+            srele_reminders = data.get("reminders", [])
+            print(f"Loaded {len(srele_reminders)} reminders from {REMINDERS_FILE}")
+    except FileNotFoundError:
+        srele_reminders = []
+        print("No reminders file yet, starting empty")
+    except Exception as e:
+        srele_reminders = []
+        print(f"Could not load reminders: {e}")
+
+
+def _persist_reminders():
+    try:
+        with open(REMINDERS_FILE, "w") as f:
+            json.dump({"reminders": srele_reminders}, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Could not save reminders: {e}")
+
+
+def add_reminder(due_at_unix, channel_id, msg_text, mentions=None, created_by=""):
+    """Append a new reminder and persist."""
+    global srele_reminders
+    rem = {
+        "id": int(time.time() * 1000),
+        "due_at_unix": int(due_at_unix),
+        "channel_id": str(channel_id),
+        "message": msg_text,
+        "mentions": mentions or [],
+        "created_by": created_by,
+        "created_at_unix": int(time.time()),
+    }
+    srele_reminders.append(rem)
+    _persist_reminders()
+    return rem
+
+
+def pop_due_reminders(now_unix=None):
+    """Return all reminders whose due_at_unix has passed; remove them from storage."""
+    global srele_reminders
+    if now_unix is None:
+        now_unix = int(time.time())
+    due = [r for r in srele_reminders if r.get("due_at_unix", 0) <= now_unix]
+    if due:
+        srele_reminders = [r for r in srele_reminders if r.get("due_at_unix", 0) > now_unix]
+        _persist_reminders()
+    return due
+
+
+def parse_due_at(reminder_data, now_unix=None):
+    """Convert SET_REMINDER payload to a unix timestamp.
+
+    Accepts either:
+      - delay_seconds: int, relative to now
+      - due_at_iso:   ISO 8601 string (with timezone, e.g. '2026-04-29T09:00:00+02:00')
+      - due_at_unix:  raw unix seconds
+    Returns int or None.
+    """
+    if now_unix is None:
+        now_unix = int(time.time())
+
+    if "due_at_unix" in reminder_data:
+        try:
+            return int(reminder_data["due_at_unix"])
+        except (TypeError, ValueError):
+            pass
+
+    if "delay_seconds" in reminder_data:
+        try:
+            return now_unix + max(1, int(reminder_data["delay_seconds"]))
+        except (TypeError, ValueError):
+            pass
+
+    if "due_at_iso" in reminder_data:
+        s = str(reminder_data["due_at_iso"]).strip()
+        try:
+            # Python 3.11+ handles "Z"; replace just in case.
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                # Assume LOCAL_TZ if user didn't specify
+                try:
+                    from zoneinfo import ZoneInfo
+                    dt = dt.replace(tzinfo=ZoneInfo(LOCAL_TZ_NAME))
+                except Exception:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+            return int(dt.timestamp())
+        except Exception as e:
+            print(f"parse_due_at: failed to parse '{s}': {e}")
+
+    return None
+
+
+def format_due_for_user(due_at_unix):
+    """Format a due timestamp as human-readable local + UTC."""
+    try:
+        from zoneinfo import ZoneInfo
+        local = datetime.datetime.fromtimestamp(due_at_unix, tz=ZoneInfo(LOCAL_TZ_NAME))
+        return local.strftime("%a %b %d, %H:%M ") + LOCAL_TZ_NAME
+    except Exception:
+        return datetime.datetime.utcfromtimestamp(due_at_unix).strftime("%a %b %d, %H:%M UTC")
+
+
 def build_system_prompt():
     """Build the full system prompt including any learnings."""
     prompt = SRELE_SYSTEM_BASE
+
+    # Inject current time so Srele can correctly compute reminder due times.
+    now_unix = int(time.time())
+    try:
+        from zoneinfo import ZoneInfo
+        local_now = datetime.datetime.now(ZoneInfo(LOCAL_TZ_NAME))
+        local_str = local_now.strftime("%A %Y-%m-%d %H:%M %Z")
+    except Exception:
+        local_str = datetime.datetime.utcnow().strftime("%A %Y-%m-%d %H:%M UTC")
+    utc_str = datetime.datetime.utcfromtimestamp(now_unix).strftime("%Y-%m-%d %H:%M UTC")
+    prompt += (
+        f"\n\nCURRENT TIME (use this when computing reminder due times):\n"
+        f"- Local ({LOCAL_TZ_NAME}): {local_str}\n"
+        f"- UTC: {utc_str}\n"
+        f"- Unix epoch: {now_unix}\n"
+    )
 
     if srele_learnings:
         prompt += "\n\nIMPORTANT — THINGS YOU HAVE LEARNED (always follow these):\n"
@@ -785,6 +1003,20 @@ def parse_save_command(response_text):
         return response_text, None
 
 
+def parse_relabel_command(response_text):
+    """Check if Claude's response contains a RELABEL_IDEA command."""
+    match = re.search(r'RELABEL_IDEA:(\{.*\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+
+    try:
+        data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, data
+    except json.JSONDecodeError:
+        return response_text, None
+
+
 def parse_learning_command(response_text):
     """Check if Claude's response contains a SAVE_LEARNING command."""
     match = re.search(r'SAVE_LEARNING:(\{.*\})', response_text, re.DOTALL)
@@ -827,18 +1059,144 @@ def parse_patch_command(response_text):
         return response_text, None
 
 
+def validate_code_before_push(file_name, original_code, new_code):
+    """Sanity-check patched code before pushing. Returns (ok, reason)."""
+    if not new_code or not new_code.strip():
+        return False, "new file is empty"
+
+    orig_len = len(original_code)
+    new_len = len(new_code)
+    if orig_len > 500 and new_len < orig_len * 0.5:
+        return False, (
+            f"new file is suspiciously small ({new_len} bytes vs {orig_len} original) — "
+            f"this looks like a truncated patch"
+        )
+
+    if file_name.endswith(".py"):
+        try:
+            import ast as _ast
+            _ast.parse(new_code)
+        except SyntaxError as e:
+            return False, f"Python syntax error at line {e.lineno}: {e.msg}"
+
+    return True, "ok"
+
+
+def _whitespace_normalize(s):
+    """Collapse runs of whitespace and strip per-line — for fuzzy patch matching."""
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def _fuzzy_find_and_replace(code, find_text, replace_text):
+    """Try harder to apply a find/replace.
+
+    Strategy:
+      1. Exact match (fastest, preserves original whitespace).
+      2. Whitespace-normalized match — find a contiguous slice of `code`
+         whose normalized form equals normalized `find_text`. If found,
+         splice in `replace_text` at that location.
+    Returns (new_code, found: bool).
+    """
+    if not find_text:
+        return code, False
+    if find_text in code:
+        return code.replace(find_text, replace_text, 1), True
+
+    target_norm = _whitespace_normalize(find_text)
+    if not target_norm:
+        return code, False
+
+    # Sliding-window over rough byte ranges in code, matching after normalization.
+    # We bound the candidate window by a length range around len(find_text).
+    n = len(find_text)
+    code_len = len(code)
+    # Search candidate start positions; try anchoring on first non-whitespace word.
+    first_word_match = re.search(r'\S+', find_text)
+    if not first_word_match:
+        return code, False
+    anchor = first_word_match.group(0)
+
+    for m in re.finditer(re.escape(anchor), code):
+        start = m.start()
+        # Try windows around the anchor of varying sizes
+        for delta in (0, 50, 200, 1000):
+            for end in (start + n + delta, start + n - delta):
+                if end <= start or end > code_len:
+                    continue
+                candidate = code[start:end]
+                if _whitespace_normalize(candidate) == target_norm:
+                    return code[:start] + replace_text + code[end:], True
+    return code, False
+
+
 def apply_patches(original_code, patches):
-    """Apply find-and-replace patches to code. Returns (patched_code, errors)."""
+    """Apply find-and-replace patches. Returns (patched_code, errors).
+
+    Errors include the patch index and a short prefix of the `find` text so
+    the auto-retry loop can show Srele exactly which patches missed.
+    """
     code = original_code
     errors = []
     for i, patch in enumerate(patches):
         find_text = patch.get("find", "")
         replace_text = patch.get("replace", "")
-        if find_text and find_text in code:
-            code = code.replace(find_text, replace_text, 1)
-        elif find_text:
-            errors.append(f"Patch {i+1}: couldn't find the text to replace")
+        if not find_text:
+            continue
+        new_code, ok = _fuzzy_find_and_replace(code, find_text, replace_text)
+        if ok:
+            code = new_code
+        else:
+            preview = find_text.strip().split("\n")[0][:80]
+            errors.append(f"Patch {i+1} (find prefix: {preview!r})")
     return code, errors
+
+
+async def auto_retry_failed_patches(channel_id, file_name, current_code, failed_patches_info):
+    """Ask Srele to re-emit corrected PATCH_CODE for patches that failed.
+
+    Returns the new patches list (or None if no usable response).
+    """
+    failure_blob = "\n".join(f"  - {info}" for info in failed_patches_info)
+    prompt = (
+        f"Your previous PATCH_CODE for `{file_name}` partially failed — these patches "
+        f"could not be located in the current file:\n{failure_blob}\n\n"
+        f"Here is the EXACT current content of `{file_name}` (line-numbered for reference):\n\n"
+        f"```python\n{current_code}\n```\n\n"
+        f"Re-emit a NEW PATCH_CODE that contains ONLY the patches that previously failed, "
+        f"with `find` strings copied verbatim from the file above (whitespace and indentation must match exactly). "
+        f"Do not include patches that already succeeded. Output ONLY the PATCH_CODE command, no prose."
+    )
+    response = chat_with_claude(channel_id, "SYSTEM", prompt)
+    _clean, retry_data = parse_patch_command(response)
+    if not retry_data:
+        return None
+    return retry_data.get("patches") or None
+
+
+def parse_set_reminder_command(response_text):
+    """Check if Claude's response contains a SET_REMINDER command."""
+    match = re.search(r'SET_REMINDER:(\{.*\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+    try:
+        data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, data
+    except json.JSONDecodeError:
+        return response_text, None
+
+
+def parse_read_history_command(response_text):
+    """Check if Claude's response contains a READ_HISTORY command."""
+    match = re.search(r'READ_HISTORY:(\{.*\})', response_text, re.DOTALL)
+    if not match:
+        return response_text, None
+    try:
+        data = json.loads(match.group(1))
+        clean_text = response_text[:match.start()].rstrip()
+        return clean_text, data
+    except json.JSONDecodeError:
+        return response_text, None
 
 
 def parse_send_message_command(response_text):
@@ -869,39 +1227,78 @@ def parse_read_code_command(response_text):
         return response_text, None
 
 
+async def _find_member(guild, name):
+    """Look up a guild member by display name or username (case-insensitive, exact match preferred)."""
+    n = name.lower().strip()
+    if not n:
+        return None
+
+    # Local cache — exact match first
+    member = discord.utils.find(
+        lambda m: m.display_name.lower() == n or m.name.lower() == n,
+        guild.members
+    )
+    if member:
+        return member
+
+    # Local cache — startswith match (handles "Matej" → "Matej K.")
+    member = discord.utils.find(
+        lambda m: m.display_name.lower().startswith(n) or m.name.lower().startswith(n),
+        guild.members
+    )
+    if member:
+        return member
+
+    # Fall back to Discord server-side search
+    try:
+        results = await guild.query_members(query=name, limit=5)
+        for m in results:
+            if m.display_name.lower() == n or m.name.lower() == n:
+                return m
+        if results:
+            return results[0]
+    except Exception as e:
+        print(f"Could not query members for '{name}': {e}")
+
+    return None
+
+
 async def resolve_mentions(guild, message_text):
-    """Replace {{username}} with actual Discord @mentions."""
-    pattern = re.compile(r'\{\{(.+?)\}\}')
-    matches = pattern.findall(message_text)
+    """Replace {{username}} and @username placeholders with real Discord <@user_id> pings.
 
-    for name in matches:
-        member = None
+    Supported syntaxes:
+      - {{Name}}   — explicit template (preferred)
+      - @Name      — bare handle (matched only if Name is 3+ alphanumeric chars AND matches a known member)
+    Does not touch already-resolved <@123> mentions.
+    """
+    if not guild or not message_text:
+        return message_text
 
-        # First try the local cache
-        member = discord.utils.find(
-            lambda m, n=name: m.display_name.lower() == n.lower() or m.name.lower() == n.lower(),
-            guild.members
-        )
+    # 1) {{Name}} — explicit template. Replace whether we find the member or not.
+    brace_pattern = re.compile(r'\{\{([^{}]+?)\}\}')
+    for name in set(brace_pattern.findall(message_text)):
+        member = await _find_member(guild, name)
+        replacement = member.mention if member else f"@{name}"
+        message_text = message_text.replace(f"{{{{{name}}}}}", replacement)
 
-        # If not found in cache, search Discord directly
-        if not member:
-            try:
-                results = await guild.query_members(query=name, limit=5)
-                for m in results:
-                    if m.display_name.lower() == name.lower() or m.name.lower() == name.lower():
-                        member = m
-                        break
-                # If exact match not found, use first result
-                if not member and results:
-                    member = results[0]
-            except Exception as e:
-                print(f"Could not query members for '{name}': {e}")
+    # 2) @Name — bare handle. Only replace when we can match an actual member, so we don't
+    #    mangle casual "@ home" or email-looking strings. Skip if already inside <@...>.
+    at_pattern = re.compile(r'(?<![<\w])@([A-Za-z][A-Za-z0-9._-]{2,31})\b')
 
-        if member:
-            message_text = message_text.replace(f"{{{{{name}}}}}", member.mention)
-        else:
-            message_text = message_text.replace(f"{{{{{name}}}}}", f"@{name}")
+    async def _replace_at(text):
+        # Iterate matches right-to-left so replacements don't shift indices.
+        matches = list(at_pattern.finditer(text))
+        for m in reversed(matches):
+            name = m.group(1)
+            # Skip if this looks like role/everyone/here
+            if name.lower() in {"everyone", "here"}:
+                continue
+            member = await _find_member(guild, name)
+            if member:
+                text = text[: m.start()] + member.mention + text[m.end():]
+        return text
 
+    message_text = await _replace_at(message_text)
     return message_text
 
 
@@ -968,6 +1365,44 @@ intents.members = True
 bot = commands.Bot(command_prefix="!srele ", intents=intents)
 
 
+@tasks.loop(seconds=30)
+async def reminder_loop():
+    """Every 30s: fire any due reminders, ping the listed users in their original channel."""
+    try:
+        due = pop_due_reminders()
+        if not due:
+            return
+        for rem in due:
+            try:
+                channel = bot.get_channel(int(rem["channel_id"]))
+                if channel is None:
+                    try:
+                        channel = await bot.fetch_channel(int(rem["channel_id"]))
+                    except Exception as e:
+                        print(f"reminder_loop: channel {rem['channel_id']} unreachable: {e}")
+                        continue
+
+                ping_text = ""
+                if rem.get("mentions"):
+                    ping_text = " ".join(f"{{{{{n}}}}}" for n in rem["mentions"])
+                    ping_text = await resolve_mentions(channel.guild, ping_text)
+                    ping_text = ping_text.strip()
+
+                body = f"\u23f0 Reminder: {rem['message']}"
+                full = f"{ping_text}\n{body}" if ping_text else body
+                await channel.send(full)
+                print(f"Fired reminder {rem['id']} in #{channel.name}: {rem['message'][:60]}")
+            except Exception as e:
+                print(f"reminder_loop: failed to deliver reminder {rem.get('id')}: {e}")
+    except Exception as e:
+        print(f"reminder_loop crashed: {e}")
+
+
+@reminder_loop.before_loop
+async def _before_reminder_loop():
+    await bot.wait_until_ready()
+
+
 @bot.event
 async def on_ready():
     print(f"\n Srele is online as {bot.user} (ID: {bot.user.id})")
@@ -976,6 +1411,11 @@ async def on_ready():
 
     # Load learnings from learnings.json on startup
     load_learnings()
+
+    # Load reminders from reminders.json on startup, then start the dispatch loop
+    load_reminders()
+    if not reminder_loop.is_running():
+        reminder_loop.start()
 
     await bot.change_presence(
         activity=discord.Activity(
@@ -1023,13 +1463,42 @@ async def on_message(message):
                     patched_code, patch_errors = apply_patches(current_code, push_data["patches"])
 
                     if patch_errors:
-                        await message.reply(f"Some patches failed: {', '.join(patch_errors)}")
+                        await message.reply(
+                            f"Some patches missed ({', '.join(patch_errors)}) — "
+                            f"asking Srele to re-emit corrected versions against the live file..."
+                        )
+                        new_patches = await auto_retry_failed_patches(
+                            channel_key, file_name, current_code, patch_errors
+                        )
+                        if not new_patches:
+                            await message.channel.send(
+                                "Auto-retry didn't produce new patches. Push aborted — "
+                                "ask me to re-read the code and try again."
+                            )
+                            return
+                        # Apply the corrected patches to the ORIGINAL code (not the partially-patched one).
+                        patched_code, retry_errors = apply_patches(current_code, new_patches)
+                        if retry_errors:
+                            await message.channel.send(
+                                f"Even the retry missed: {', '.join(retry_errors)}. Push aborted — "
+                                f"the patch context probably doesn't exist in the file at all."
+                            )
+                            return
+                        await message.channel.send("Auto-retry succeeded. Continuing with push...")
+
+                    ok, reason = validate_code_before_push(file_name, current_code, patched_code)
+                    if not ok:
+                        await message.reply(f"Refused to push — {reason}. No changes made to GitHub.")
                         return
 
                     success, result_msg = github_push_file(file_name, patched_code, commit_msg)
-                # Legacy PUSH_CODE: full file content
+                # Legacy PUSH_CODE: full file content — DISABLED to prevent truncated pushes
                 elif "content" in push_data:
-                    success, result_msg = github_push_file(file_name, push_data["content"], commit_msg)
+                    await message.reply(
+                        "PUSH_CODE (full-file) is disabled — it's the one that caused the truncated-file bug. "
+                        "Ask me to re-do the change as a PATCH_CODE (find/replace) and I'll push that safely."
+                    )
+                    return
                 else:
                     await message.reply("No changes to push.")
                     return
@@ -1156,6 +1625,13 @@ async def on_message(message):
                 channel_context=channel_context,
             )
 
+            # Resolve mention placeholders ({{Name}} and bare @Name) to real <@user_id>
+            # before any dispatch, so replies, SEND_MESSAGE, etc. all ping correctly.
+            try:
+                response = await resolve_mentions(message.guild, response)
+            except Exception as e:
+                print(f"resolve_mentions failed: {e}")
+
             # Check for READ_CODE first — Srele wants to see its own code
             display_text, read_data = parse_read_code_command(response)
             if read_data:
@@ -1214,6 +1690,56 @@ async def on_message(message):
                     await message.channel.send(f"Couldn't read `{file_to_read}` from GitHub. Check if GITHUB_TOKEN is set.")
                 return
 
+            # Check for READ_HISTORY — deep scan of chat history
+            display_text, history_data = parse_read_history_command(display_text)
+            if history_data:
+                req_channel_name = (history_data.get("channel") or "").strip().lstrip("#")
+                req_limit = history_data.get("limit", 300)
+                try:
+                    req_limit = max(1, min(int(req_limit), 500))
+                except (TypeError, ValueError):
+                    req_limit = 300
+
+                if req_channel_name:
+                    target_channel = discord.utils.get(message.guild.text_channels, name=req_channel_name)
+                else:
+                    target_channel = message.channel
+
+                if display_text:
+                    await message.reply(display_text)
+
+                if not target_channel:
+                    await message.channel.send(f"Couldn't find channel **#{req_channel_name}**.")
+                    return
+
+                scanning_msg = await message.channel.send(
+                    f"Scanning last {req_limit} messages of #{target_channel.name}..."
+                )
+                try:
+                    history_msgs = await fetch_channel_history_for_summary(target_channel, limit=req_limit)
+                except Exception as e:
+                    await scanning_msg.delete()
+                    await message.channel.send(f"Couldn't read history: `{str(e)[:80]}`")
+                    return
+
+                await scanning_msg.delete()
+
+                history_blob = "\n".join(history_msgs) if history_msgs else "(no messages found)"
+                followup_prompt = (
+                    f"[HISTORY from #{target_channel.name} — {len(history_msgs)} messages, oldest first]\n\n"
+                    f"{history_blob}\n\n"
+                    f"[END HISTORY]\n\n"
+                    f"Now answer the user's original request using this history. "
+                    f"If the request implies action (saving or relabeling ideas), emit the appropriate command."
+                )
+                response = chat_with_claude(
+                    str(message.channel.id),
+                    "SYSTEM",
+                    followup_prompt,
+                )
+                display_text = response
+                # fall through into the rest of the dispatch chain
+
             # Check for GENERATE_IMAGE command
             display_text, image_gen_data = parse_generate_image_command(display_text)
             if image_gen_data:
@@ -1224,19 +1750,8 @@ async def on_message(message):
 
                     generating_msg = await message.channel.send("Generating image... ~15-30 seconds.")
 
-                    # Extract image-to-image parameters
-                    ref_image_url = image_gen_data.get("image_url", None)
-                    img_strength = image_gen_data.get("strength", 0.65)
-
-                    # If no image_url in command but user attached images, use the first one
-                    if not ref_image_url and image_urls:
-                        ref_image_url = image_urls[0]
-                        print(f"Auto-using attached image as reference: {ref_image_url[:80]}...")
-
                     loop = asyncio.get_event_loop()
-                    image_url, error = await loop.run_in_executor(
-                        None, generate_image_fal, prompt, ref_image_url, img_strength
-                    )
+                    image_url, error = await loop.run_in_executor(None, generate_image_fal, prompt)
 
                     await generating_msg.delete()
 
@@ -1366,13 +1881,83 @@ async def on_message(message):
                     await message.reply(display_text or "I need a channel name and a message to send.")
                 return
 
+            # Check for SET_REMINDER (real scheduled reminder)
+            display_text, reminder_data = parse_set_reminder_command(display_text)
+            if reminder_data:
+                due_unix = parse_due_at(reminder_data)
+                msg_text = (reminder_data.get("message") or "").strip()
+                mentions = reminder_data.get("mentions") or []
+
+                if display_text:
+                    await message.reply(display_text)
+
+                if not due_unix or not msg_text:
+                    await message.channel.send(
+                        "Couldn't set the reminder — missing/invalid time or message."
+                    )
+                    return
+
+                if due_unix <= int(time.time()):
+                    await message.channel.send(
+                        "Couldn't set the reminder — the time you gave me is in the past."
+                    )
+                    return
+
+                rem = add_reminder(
+                    due_at_unix=due_unix,
+                    channel_id=message.channel.id,
+                    msg_text=msg_text,
+                    mentions=mentions,
+                    created_by=message.author.display_name,
+                )
+                human_when = format_due_for_user(due_unix)
+                mention_preview = ", ".join(mentions) if mentions else "—"
+                embed = discord.Embed(
+                    title="Reminder set",
+                    description=msg_text,
+                    color=0x579bfc,
+                )
+                embed.add_field(name="When", value=human_when, inline=False)
+                embed.add_field(name="Will ping", value=mention_preview, inline=True)
+                embed.set_footer(text=f"id {rem['id']} · in #{message.channel.name}")
+                await message.channel.send(embed=embed)
+                await message.add_reaction("\u23f0")  # alarm clock
+                return
+
+            # Check for relabel command first (updates an existing item)
+            display_text, relabel_data = parse_relabel_command(display_text)
+            if relabel_data:
+                q = relabel_data.get("query", "").strip()
+                priority = str(relabel_data.get("priority", "normal")).lower().strip()
+                priority_id = PRIORITY_KEYWORDS.get(priority, PRIORITY_TO_BE_MADE)
+
+                target = find_monday_item_by_name(q) if q else None
+                if display_text:
+                    await message.reply(display_text)
+
+                if not target:
+                    await message.channel.send(f"Couldn't find an item matching **{q}** on the board.")
+                else:
+                    update_monday_item_priority(target["id"], priority_id)
+                    monday_url = f"https://tryreact1s-team.monday.com/boards/{MONDAY_BOARD_ID}/pulses/{target['id']}"
+                    embed = discord.Embed(
+                        title="Idea Relabeled!",
+                        description=f"**{target['name']}**",
+                        color=0x579bfc,
+                        url=monday_url,
+                    )
+                    embed.add_field(name="New priority", value=PRIORITY_LABELS.get(priority_id, priority), inline=True)
+                    await message.channel.send(embed=embed)
+                    await message.add_reaction("\u2705")
+                return
+
             # Check for save idea command
             display_text, idea_data = parse_save_command(display_text)
 
             if idea_data:
                 idea_text = idea_data.get("idea", raw_text)
-                priority = idea_data.get("priority", "normal")
-                priority_id = PRIORITY_WORKING_ON_IT if priority == "high" else PRIORITY_TO_BE_MADE
+                priority = str(idea_data.get("priority", "normal")).lower().strip()
+                priority_id = PRIORITY_KEYWORDS.get(priority, PRIORITY_TO_BE_MADE)
 
                 item_name = generate_item_name(idea_text)
                 item = create_monday_item(item_name, priority_id)
@@ -1393,11 +1978,7 @@ async def on_message(message):
 
                 monday_url = f"https://tryreact1s-team.monday.com/boards/{MONDAY_BOARD_ID}/pulses/{item_id}"
 
-                priority_labels = {
-                    PRIORITY_TO_BE_MADE: "To be made",
-                    PRIORITY_WORKING_ON_IT: "Working on it",
-                    PRIORITY_DONE: "Done",
-                }
+                priority_labels = PRIORITY_LABELS
 
                 if display_text:
                     await message.reply(display_text)
@@ -1475,10 +2056,7 @@ async def slash_idea(interaction: discord.Interaction, text: str):
 
         monday_url = f"https://tryreact1s-team.monday.com/boards/{MONDAY_BOARD_ID}/pulses/{item_id}"
 
-        priority_labels = {
-            PRIORITY_TO_BE_MADE: "To be made",
-            PRIORITY_WORKING_ON_IT: "Working on it",
-        }
+        priority_labels = PRIORITY_LABELS
 
         embed = discord.Embed(
             title="Idea Saved!",
