@@ -2048,7 +2048,18 @@ async def on_message(message):
                     req_limit = 300
 
                 if req_channel_name:
-                    target_channel = discord.utils.get(message.guild.text_channels, name=req_channel_name)
+                    target_channel = None
+                    # Try as channel ID first (handles <#123> mentions where ID gets passed as name)
+                    if req_channel_name.isdigit():
+                        target_channel = message.guild.get_channel(int(req_channel_name))
+                        if target_channel is None:
+                            try:
+                                target_channel = await bot.fetch_channel(int(req_channel_name))
+                            except Exception:
+                                target_channel = None
+                    # Fallback: lookup by name
+                    if target_channel is None:
+                        target_channel = discord.utils.get(message.guild.text_channels, name=req_channel_name)
                 else:
                     target_channel = message.channel
 
