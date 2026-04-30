@@ -1811,6 +1811,85 @@ async def _before_reminder_loop():
     await bot.wait_until_ready()
 
 
+# Regex to strip a previously-appended ' | HH:MM' suffix so we don't accumulate.
+NICK_TIME_SUFFIX = re.compile(r'\s*\|\s*\d{1,2}:\d{2}\s*$')
+
+
+@tasks.loop(minutes=20)
+async def nickname_update_loop():
+    """Every 20 min: update each registered user's nickname to 'Name | HH:MM' in their local tz."""
+    if not srele_timezones:
+        return
+    try:
+        from zoneinfo import ZoneInfo
+    except Exception as e:
+        print(f"nickname_update_loop: zoneinfo unavailable: {e}")
+        return
+
+    for guild in bot.guilds:
+        # Skip if bot lacks Manage Nicknames permission in this guild
+        me = guild.me
+        if not me or not guild.me.guild_permissions.manage_nicknames:
+            continue
+
+        for uid_str, tz_name in list(srele_timezones.items()):
+            if not uid_str.isdigit():
+                continue
+            member = guild.get_member(int(uid_str))
+            if member is None:
+                continue
+            # Skip server owner — Discord forbids changing owner's nickname
+            if member.id == guild.owner_id:
+                continue
+            # Skip members whose top role is >= bot's top role (Discord forbids)
+            try:
+                if member.top_role >= me.top_role and member.id != me.id:
+                    continue
+            except Exception:
+                pass
+
+            try:
+                now_local = datetime.datetime.now(ZoneInfo(tz_name))
+                time_str = now_local.strftime("%H:%M")
+            except Exception as e:
+                print(f"nickname_update_loop: bad tz '{tz_name}' for {member.display_name}: {e}")
+                continue
+
+            # Strip any prior ' | HH:MM' suffix from current nickname/username to get the base name
+            current = member.nick or member.name
+            base = NICK_TIME_SUFFIX.sub('', current).strip()
+            new_nick = f"{base} | {time_str}"
+
+            # Discord nickname max length is 32
+            if len(new_nick) > 32:
+                allowed = 32 - len(f" | {time_str}")
+                base = base[:allowed].rstrip()
+                new_nick = f"{base} | {time_str}"
+
+            if (member.nick or '') == new_nick:
+                continue
+
+            try:
+                await member.edit(nick=new_nick, reason="Srele timezone nickname update")
+            except discord.Forbidden:
+                # Bot lacks permission for this specific user (role hierarchy)
+                pass
+            except discord.HTTPException as e:
+                print(f"nickname_update_loop: HTTP error updating {member.display_name}: {e}")
+            except Exception as e:
+                print(f"nickname_update_loop: unexpected error for {member.display_name}: {e}")
+
+            # Tiny pause to avoid hammering rate limits when many users registered
+            await asyncio.sleep(0.5)
+
+
+@nickname_update_loop.before_loop
+async def _before_nickname_loop():
+    await bot.wait_until_ready()
+    # Small delay so on_ready finishes loading state first
+    await asyncio.sleep(5)
+
+
 @bot.event
 async def on_ready():
     print(f"\n Srele is online as {bot.user} (ID: {bot.user.id})")
@@ -1826,6 +1905,8 @@ async def on_ready():
     load_timezones()
     if not reminder_loop.is_running():
         reminder_loop.start()
+    if not nickname_update_loop.is_running():
+        nickname_update_loop.start()
 
     await bot.change_presence(
         activity=discord.Activity(
